@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+aiofiles
+torch
+torchaudio
+librosa
+soundfile
+onnxruntime
+transformers
+accelerate

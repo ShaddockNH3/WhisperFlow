@@ -91,7 +91,8 @@ def setup_runtime():
             "fastapi", "uvicorn", "python-multipart", "pydantic", "aiofiles",
             "torch", "torchaudio", # uv handles index-url better if passed as args or in requirements
             "faster-whisper", "onnxruntime", "python-dotenv", "websockets",
-            "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0"
+            "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0",
+            "zhipuai>=2.1.0",
         ]
         
         # Use uv pip install for speed

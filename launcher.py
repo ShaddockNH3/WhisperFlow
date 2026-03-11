@@ -1,0 +1,141 @@
+import os
+import sys
+import subprocess
+import urllib.request
+import zipfile
+import tarfile
+import shutil
+from pathlib import Path
+
+# Configuration
+APP_NAME = "WhisperFlow"
+VERSION = "v1.0.0"
+DATA_DIR = Path(sys.executable).parent / "data"
+RUNTIME_DIR = DATA_DIR / "runtime"
+MODELS_DIR = DATA_DIR / "models"
+# Specific paths for Python 3.12.3
+PYTHON_EXE = RUNTIME_DIR / ("python.exe" if sys.platform == "win32" else "bin/python3")
+
+# URL for portable Python 3.12.3
+PYTHON_URLS = {
+    "win32": "https://www.python.org/ftp/python/3.12.3/python-3.12.3-embed-amd64.zip",
+    "linux": "https://github.com/indygreg/python-build-standalone/releases/download/20240415/cpython-3.12.3+20240415-x86_64-unknown-linux-gnu-install_only.tar.gz"
+}
+
+def report_progress(count, block_size, total_size):
+    percent = int(count * block_size * 100 / total_size)
+    sys.stdout.write(f"\rDownloading Runtime (Python 3.12.3)... {percent}%")
+    sys.stdout.flush()
+
+def setup_runtime():
+    if PYTHON_EXE.exists():
+        return True
+
+    print(f"--- {APP_NAME} First Run Setup ---")
+    print(f"Installing isolated Python 3.12.3 environment into {RUNTIME_DIR}...")
+    
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+    url = PYTHON_URLS.get(sys.platform if sys.platform == "win32" else "linux")
+    if not url:
+        print(f"Unsupported platform: {sys.platform}")
+        return False
+
+    temp_file = DATA_DIR / ("python_runtime.zip" if sys.platform == "win32" else "python_runtime.tar.gz")
+    
+    try:
+        urllib.request.urlretrieve(url, temp_file, reporthook=report_progress)
+        print("\nExtracting environment...")
+        
+        if sys.platform == "win32":
+            with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                zip_ref.extractall(RUNTIME_DIR)
+            
+            # Windows Embeddable Python Fix: Enable site-packages
+            pth_file = RUNTIME_DIR / "python312._pth"
+            if pth_file.exists():
+                with open(pth_file, "w") as f:
+                    # Overwrite to ensure standard imports work
+                    f.write(".\n")
+                    f.write("python312.zip\n")
+                    f.write("Lib/site-packages\n")
+                    f.write("import site\n")
+            (RUNTIME_DIR / "Lib/site-packages").mkdir(parents=True, exist_ok=True)
+        else:
+            with tarfile.open(temp_file, "r:gz") as tar_ref:
+                tar_ref.extractall(DATA_DIR)
+                extracted_dir = DATA_DIR / "python"
+                if extracted_dir.exists():
+                    if RUNTIME_DIR.exists():
+                        shutil.rmtree(RUNTIME_DIR)
+                    shutil.move(extracted_dir, RUNTIME_DIR)
+
+        temp_file.unlink()
+        
+        print("Installing package manager (pip & uv for speed)...")
+        pip_script = DATA_DIR / "get-pip.py"
+        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", pip_script)
+        subprocess.run([str(PYTHON_EXE), str(pip_script), "--no-warn-script-location"], check=True)
+        pip_script.unlink()
+
+        # Install uv to speed up the rest of the installations
+        subprocess.run([str(PYTHON_EXE), "-m", "pip", "install", "uv", "--no-warn-script-location"], check=True)
+
+        print("Downloading AI libraries using uv (this will be much faster)...")
+        # Ensure uv uses a local cache directory for zero-trace
+        uv_cache = DATA_DIR / "uv_cache"
+        uv_cache.mkdir(parents=True, exist_ok=True)
+        
+        deps = [
+            "fastapi", "uvicorn", "python-multipart", "pydantic", "aiofiles",
+            "torch", "torchaudio", # uv handles index-url better if passed as args or in requirements
+            "faster-whisper", "onnxruntime", "python-dotenv", "websockets",
+            "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0"
+        ]
+        
+        # Use uv pip install for speed
+        env = os.environ.copy()
+        env["UV_CACHE_DIR"] = str(uv_cache)
+        
+        cmd = [
+            str(PYTHON_EXE), "-m", "uv", "pip", "install",
+            "--index-url", "https://pypi.org/simple",
+            "--extra-index-url", "https://download.pytorch.org/whl/cpu",
+            "--no-warn-script-location"
+        ] + deps
+        
+        subprocess.run(cmd, env=env, check=True)
+        
+        # Cleanup uv cache if you want to be super lightweight, 
+        # but keeping it makes future updates faster.
+        # shutil.rmtree(uv_cache) 
+        
+        print("\n--- Setup Complete! WhisperFlow is ready. ---")
+        return True
+    except Exception as e:
+        print(f"\nError during isolation setup: {e}")
+        return False
+
+def launch_backend():
+    print(f"Starting {APP_NAME}...")
+    backend_script = Path(__file__).parent / "backend" / "main.py"
+    
+    # Set environment variables for portability within the subprocess
+    env = os.environ.copy()
+    env["HF_HOME"] = str(MODELS_DIR / "huggingface")
+    env["XDG_CACHE_HOME"] = str(MODELS_DIR / "xdg")
+    env["TORCH_HOME"] = str(MODELS_DIR / "torch")
+    
+    try:
+        # Run the backend using the portable python
+        subprocess.run([str(PYTHON_EXE), str(backend_script)], env=env)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+
+if __name__ == "__main__":
+    if setup_runtime():
+        launch_backend()
+    else:
+        print("Failed to initialize environment.")
+        input("Press Enter to exit...")

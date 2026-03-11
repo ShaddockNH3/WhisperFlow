@@ -22,7 +22,7 @@ rm -rf build dist
 mkdir -p build/frontend/dist
 cp -r frontend/dist/* build/frontend/dist/
 
-echo "--- Step 3: Packaging with PyInstaller ---"
+echo "--- Step 3: Packaging Bootstrap Launcher ---"
 
 # Check for pyinstaller, install if missing
 if ! python3 -m PyInstaller --version > /dev/null 2>&1; then
@@ -30,26 +30,14 @@ if ! python3 -m PyInstaller --version > /dev/null 2>&1; then
     python3 -m pip install pyinstaller
 fi
 
-python3 -m PyInstaller --onedir \
+# We only package launcher.py. Heavy libs like torch will be downloaded by it.
+python3 -m PyInstaller --onefile \
     --name WhisperFlow \
     --add-data "frontend/dist:frontend/dist" \
-    --add-data "ai/denoise/weights:ai/denoise/weights" \
-    --collect-all faster_whisper \
-    --collect-all onnxruntime \
-    --hidden-import uvicorn.logging \
-    --hidden-import uvicorn.loops \
-    --hidden-import uvicorn.loops.auto \
-    --hidden-import uvicorn.protocols \
-    --hidden-import uvicorn.protocols.http \
-    --hidden-import uvicorn.protocols.http.auto \
-    --hidden-import uvicorn.protocols.websockets \
-    --hidden-import uvicorn.protocols.websockets.auto \
-    --hidden-import uvicorn.lifespan \
-    --hidden-import uvicorn.lifespan.on \
-    backend/main.py
+    --add-data "backend:backend" \
+    --add-data "ai:ai" \
+    launcher.py
 
 echo "--- Build Complete! ---"
-echo "The executable 'WhisperFlow' is located in the 'dist' folder."
-echo "Users can double-click it to start the application."
-echo "Note: All data (models, etc.) will be stored in a 'data' folder next to the executable."
-echo "To uninstall, simply delete the folder containing WhisperFlow."
+echo "The tiny executable 'WhisperFlow' is located in the 'dist' folder."
+echo "Note: On first run, it will download about 500MB of runtime components."

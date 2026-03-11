@@ -16,28 +16,17 @@ if exist dist rmdir /s /q dist
 mkdir build\frontend\dist
 xcopy /e /y frontend\dist build\frontend\dist
 
-echo --- Step 3: Packaging with PyInstaller ---
+echo --- Step 3: Packaging Bootstrap Launcher ---
 python -m pip install pyinstaller
 
-python -m PyInstaller --onedir ^
+python -m PyInstaller --onefile ^
     --name WhisperFlow ^
     --add-data "frontend/dist;frontend/dist" ^
-    --add-data "ai/denoise/weights;ai/denoise/weights" ^
-    --collect-all faster_whisper ^
-    --collect-all onnxruntime ^
-    --hidden-import uvicorn.logging ^
-    --hidden-import uvicorn.loops ^
-    --hidden-import uvicorn.loops.auto ^
-    --hidden-import uvicorn.protocols ^
-    --hidden-import uvicorn.protocols.http ^
-    --hidden-import uvicorn.protocols.http.auto ^
-    --hidden-import uvicorn.protocols.websockets ^
-    --hidden-import uvicorn.protocols.websockets.auto ^
-    --hidden-import uvicorn.lifespan ^
-    --hidden-import uvicorn.lifespan.on ^
-    backend/main.py
+    --add-data "backend;backend" ^
+    --add-data "ai;ai" ^
+    launcher.py
 
 echo --- Build Complete! ---
-echo The executable 'WhisperFlow.exe' is located in the 'dist' folder.
-echo Note: All data (models, etc.) will be stored in a 'data' folder next to the executable.
+echo The tiny executable 'WhisperFlow.exe' is located in the 'dist' folder.
+echo Note: On first run, it will download necessary components to the 'data' folder.
 pause

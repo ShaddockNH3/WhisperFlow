@@ -11,7 +11,7 @@ from pathlib import Path
 APP_NAME = "WhisperFlow"
 VERSION = "v1.0.0"
 # Increment this whenever the deps list below changes, to force re-install on existing runtimes.
-DEPS_VERSION = "2"
+DEPS_VERSION = "3"
 DATA_DIR = Path(sys.executable).parent / "data"
 RUNTIME_DIR = DATA_DIR / "runtime"
 MODELS_DIR = DATA_DIR / "models"
@@ -41,6 +41,8 @@ def _install_deps():
         "faster-whisper", "onnxruntime", "python-dotenv", "websockets",
         "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0",
         "zhipuai>=2.1.0",
+        # transitive deps that Windows embedded Python may miss
+        "sniffio", "anyio", "httpx", "httpcore", "certifi", "h11",
     ]
 
     env = os.environ.copy()
@@ -133,34 +135,54 @@ def setup_runtime():
     print("\n--- Setup Complete! WhisperFlow is ready. ---")
     return True
 
+def pause_and_exit(code: int = 1):
+    """Keep the CMD window open until the user presses Enter."""
+    print("\nPress Enter to exit...")
+    try:
+        input()
+    except Exception:
+        pass
+    sys.exit(code)
+
+
 def launch_backend():
     print(f"Starting {APP_NAME}...")
     # Since launcher is bundled, __file__ points to the temp extraction dir
     temp_dir = Path(__file__).parent
     backend_script = temp_dir / "backend" / "main.py"
-    
+
     # The real app folder where the .exe sits
     real_app_root = Path(sys.executable).parent
-    
+
     # Set environment variables for portability within the subprocess
     env = os.environ.copy()
     env["WHISPERFLOW_APP_ROOT"] = str(real_app_root)
     env["HF_HOME"] = str(MODELS_DIR / "huggingface")
     env["XDG_CACHE_HOME"] = str(MODELS_DIR / "xdg")
     env["TORCH_HOME"] = str(MODELS_DIR / "torch")
-    
+
     # Ensure backend folder is in PYTHONPATH so imports like 'from router import ...' work
     env["PYTHONPATH"] = str(temp_dir / "backend") + os.pathsep + env.get("PYTHONPATH", "")
-    
+
     try:
-        # Run the backend using the portable python
-        subprocess.run([str(PYTHON_EXE), str(backend_script)], env=env)
+        result = subprocess.run([str(PYTHON_EXE), str(backend_script)], env=env)
+        if result.returncode != 0:
+            print(f"\nBackend exited with error code {result.returncode}.")
+            pause_and_exit(result.returncode)
     except KeyboardInterrupt:
         print("\nStopping...")
+    except Exception as e:
+        print(f"\nFailed to launch backend: {e}")
+        pause_and_exit(1)
+
 
 if __name__ == "__main__":
-    if setup_runtime():
-        launch_backend()
-    else:
-        print("Failed to initialize environment.")
-        input("Press Enter to exit...")
+    try:
+        if setup_runtime():
+            launch_backend()
+        else:
+            print("Failed to initialize environment.")
+            pause_and_exit(1)
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        pause_and_exit(1)

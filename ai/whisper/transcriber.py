@@ -8,7 +8,7 @@ class WhisperTranscriber:
     Wrapper for faster-whisper (CTranslate2 backend) for ultra-fast, low-latency inference.
     Also includes OpenCC to convert Traditional Chinese to Simplified automatically.
     """
-    def __init__(self, model_id: str = "base"):
+    def __init__(self, model_id: str = "base", download_root: str = None):
         # If user passed an openai tag like "openai/whisper-turbo", extract the last part
         if "/" in model_id:
             model_id = model_id.split("/")[-1]
@@ -23,7 +23,12 @@ class WhisperTranscriber:
         
         print(f"Loading faster-whisper model '{model_id}' on {self.device} with {self.compute_type}...")
         
-        self.model = WhisperModel(model_id, device=self.device, compute_type=self.compute_type)
+        self.model = WhisperModel(
+            model_id, 
+            device=self.device, 
+            compute_type=self.compute_type,
+            download_root=download_root
+        )
         self.cc = opencc.OpenCC('t2s')  # Traditional to Simplified conversion
         # Serialise all inference calls — prevents race condition between
         # partial-preview and committed-phrase transcriptions running concurrently.

@@ -21,14 +21,31 @@ class AIPipeline:
                  use_llm: bool = True):
         print("Initializing AI Pipeline...")
         
-        # Resolve relative model path based on project root to allow starting backend from /backend dir
+        # Determine the directory where the executable or script is located
+        if getattr(sys, 'frozen', False):
+            # The directory where the .exe / binary resides
+            app_root = os.path.dirname(sys.executable)
+            base_path = sys._MEIPASS # Temp dir for bundled assets
+        else:
+            app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            base_path = app_root
+            
+        # Denoise model weight path (usually bundled, so use base_path)
         if not os.path.isabs(denoise_model_path):
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            denoise_model_path = os.path.join(project_root, denoise_model_path)
+            denoise_model_path = os.path.join(base_path, denoise_model_path)
+            
+        # Ensure model cache is in a folder NEXT TO the executable for portability
+        model_cache_dir = os.path.join(app_root, "data", "models")
+        os.makedirs(model_cache_dir, exist_ok=True)
+        
+        # Set environment variables for cache redirection to ensure NO traces in home dir
+        os.environ["HF_HOME"] = os.path.join(model_cache_dir, "huggingface")
+        os.environ["XDG_CACHE_HOME"] = os.path.join(model_cache_dir, "xdg")
+        os.environ["TORCH_HOME"] = os.path.join(model_cache_dir, "torch")
             
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 1. Initialize VAD — silence threshold and max duration are managed dynamically
+        # 1. Initialize VAD — silero-vad will download to ~/.cache/torch/hub or HF_HOME
         self.vad = VADDetector(threshold=0.15, sample_rate=16000)
         
         # 2. Initialize Denoise Model
@@ -36,12 +53,22 @@ class AIPipeline:
         if os.path.exists(denoise_model_path):
             self.denoise_model.load_state_dict(torch.load(denoise_model_path, map_location=self.device))
             self.denoise_model.eval()
-            print("Denoise model loaded.")
+            print(f"Denoise model loaded from {denoise_model_path}")
         else:
-            print(f"Warning: Denoise model weights not found at {denoise_model_path}. Denoising will be skipped or use untrained weights.")
+            # For lightweight build, if weight is not in app dir, check cache dir
+            cached_denoise = os.path.join(model_cache_dir, "denoise_crnn.pt")
+            if os.path.exists(cached_denoise):
+                self.denoise_model.load_state_dict(torch.load(cached_denoise, map_location=self.device))
+                self.denoise_model.eval()
+                print(f"Denoised model loaded from cache: {cached_denoise}")
+            else:
+                print(f"Warning: Denoise model weights not found. Running without denoising weights.")
             
-        # 3. Initialize Whisper
-        self.transcriber = WhisperTranscriber(model_id=whisper_model_id)
+        # 3. Initialize Whisper (faster-whisper handles downloads via 'download_root')
+        self.transcriber = WhisperTranscriber(
+            model_id=whisper_model_id, 
+            download_root=os.path.join(model_cache_dir, "whisper")
+        )
         
         # 4. Initialize LLM Corrector
         self.use_llm = use_llm

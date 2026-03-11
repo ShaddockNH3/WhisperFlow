@@ -1,20 +1,21 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from ws_api import router as ws_router
-from dotenv import load_dotenv
+import webbrowser
+import multiprocessing
+import uvicorn
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-load_dotenv()  # 加载项目根目录或 backend/ 目录下的 .env 文件
+load_dotenv()
 
 app = FastAPI(
-    title="WhisperFlow API",
-    description="A pseudo-streaming ASR pipeline",
+    title="WhisperFlow",
+    description="ASR System",
     version="1.0.0"
 )
 
-# Configure CORS for frontend access
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -22,6 +23,31 @@ app.add_middleware(
 
 app.include_router(ws_router, prefix="/api")
 
+# Resolve static files path for portable build
+if getattr(sys, 'frozen', False):
+    static_dir = os.path.join(sys._MEIPASS, "frontend/dist")
+else:
+    static_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend/dist")
+
+# Serve frontend if it exists
+if os.path.exists(static_dir):
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
 @app.get("/")
 async def root():
-    return {"message": "Welcome to WhisperFlow API"}
+    index_path = os.path.join(static_dir, "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"message": "WhisperFlow API is running. Frontend not found."}
+
+def open_browser():
+    # Delay slightly to ensure server is up
+    time.sleep(1.5)
+    webbrowser.open("http://127.0.0.1:8000")
+
+if __name__ == "__main__":
+    # Required for Windows PyInstaller with multiprocessing
+    multiprocessing.freeze_support()
+    # Start browser opener in a separate process
+    multiprocessing.Process(target=open_browser).start()
+    uvicorn.run(app, host="127.0.0.1", port=8000)

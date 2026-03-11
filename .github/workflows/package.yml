@@ -1,0 +1,136 @@
+name: Build and Release WhisperFlow
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: WhisperFlow-Windows
+            exec_name: WhisperFlow.exe
+          - os: ubuntu-latest
+            artifact_name: WhisperFlow-Linux
+            exec_name: WhisperFlow
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v3
+      with:
+        version: latest
+
+    - name: Build Frontend
+      working-directory: ./frontend
+      run: |
+        pnpm install
+        pnpm build
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install Python Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install pyinstaller
+        # Install backend dependencies (avoiding heavy torch during build if possible, but PyInstaller needs them for analysis)
+        python -m pip install -r backend/requirements.txt
+        python -m pip install -r ai/requirements.txt
+
+    - name: Package with PyInstaller (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        python -m PyInstaller --onefile `
+          --name WhisperFlow `
+          --add-data "frontend/dist;frontend/dist" `
+          --add-data "ai/denoise/weights;ai/denoise/weights" `
+          --collect-all faster_whisper `
+          --collect-all onnxruntime `
+          --hidden-import uvicorn.logging `
+          --hidden-import uvicorn.loops `
+          --hidden-import uvicorn.loops.auto `
+          --hidden-import uvicorn.protocols `
+          --hidden-import uvicorn.protocols.http `
+          --hidden-import uvicorn.protocols.http.auto `
+          --hidden-import uvicorn.protocols.websockets `
+          --hidden-import uvicorn.protocols.websockets.auto `
+          --hidden-import uvicorn.lifespan `
+          --hidden-import uvicorn.lifespan.on `
+          backend/main.py
+
+    - name: Package with PyInstaller (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        python3 -m PyInstaller --onefile \
+          --name WhisperFlow \
+          --add-data "frontend/dist:frontend/dist" \
+          --add-data "ai/denoise/weights:ai/denoise/weights" \
+          --collect-all faster_whisper \
+          --collect-all onnxruntime \
+          --hidden-import uvicorn.logging \
+          --hidden-import uvicorn.loops \
+          --hidden-import uvicorn.loops.auto \
+          --hidden-import uvicorn.protocols \
+          --hidden-import uvicorn.protocols.http \
+          --hidden-import uvicorn.protocols.http.auto \
+          --hidden-import uvicorn.protocols.websockets \
+          --hidden-import uvicorn.protocols.websockets.auto \
+          --hidden-import uvicorn.lifespan \
+          --hidden-import uvicorn.lifespan.on \
+          backend/main.py
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: dist/${{ matrix.exec_name }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download Windows Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: WhisperFlow-Windows
+        path: ./artifacts/windows
+
+    - name: Download Linux Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: WhisperFlow-Linux
+        path: ./artifacts/linux
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ./artifacts/windows/WhisperFlow.exe
+          ./artifacts/linux/WhisperFlow
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

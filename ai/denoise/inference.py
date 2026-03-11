@@ -73,8 +73,8 @@ def denoise_audio(model_path: str, input_wav: str, output_wav: str):
     enhanced_waveform = torch.istft(enhanced_stft, n_fft=n_fft, hop_length=hop_length, 
                                     win_length=win_length, window=window)
                                     
-    enhanced_waveform = enhanced_waveform.unsqueeze(0).cpu()
-    torchaudio.save(output_wav, enhanced_waveform, sr)
+    enhanced_waveform = enhanced_waveform.cpu().numpy()
+    sf.write(output_wav, enhanced_waveform, sr)
     print(f"Denoised audio saved to {output_wav}")
 
 if __name__ == "__main__":

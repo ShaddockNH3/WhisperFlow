@@ -1,5 +1,11 @@
 import os
 import sys
+
+# Ensure this file's directory is on sys.path so sibling modules (e.g. ws_api)
+# can always be imported, regardless of how this script is launched.
+# This is necessary when running under Windows embedded Python where PYTHONPATH is ignored.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import time
 import webbrowser
 import multiprocessing

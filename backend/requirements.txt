@@ -11,3 +11,5 @@ onnxruntime
 transformers
 accelerate
 websockets
+faster-whisper
+opencc-python-reimplemented

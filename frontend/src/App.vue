@@ -10,6 +10,17 @@
         </div>
       </template>
 
+      <div class="source-selector">
+        <el-radio-group v-model="inputSource" :disabled="isRecording" size="default">
+          <el-radio-button value="microphone">
+            <el-icon style="margin-right:4px"><Microphone /></el-icon> 麦克风
+          </el-radio-button>
+          <el-radio-button value="system">
+            <el-icon style="margin-right:4px"><Monitor /></el-icon> 系统声音
+          </el-radio-button>
+        </el-radio-group>
+      </div>
+
       <div class="controls">
         <el-button 
           v-if="!isRecording"
@@ -18,7 +29,7 @@
           @click="startRecording"
           :disabled="!wsConnected"
         >
-          <el-icon><Microphone /></el-icon> Start Speaking
+          <el-icon><Microphone /></el-icon> 开始识别
         </el-button>
         
         <el-button 
@@ -27,12 +38,14 @@
           size="large"
           @click="stopRecording"
         >
-          <el-icon><VideoPause /></el-icon> Stop Speaking
+          <el-icon><VideoPause /></el-icon> 停止识别
         </el-button>
       </div>
       
       <div v-if="isRecording" class="recording-indicator">
-        <span class="dot"></span> Recording in progress... (Sending audio chunks to backend)
+        <span class="dot"></span>
+        <template v-if="inputSource === 'microphone'">麦克风录音中...</template>
+        <template v-else>系统声音捕获中...<span class="source-tip">（请在弹窗中勾选"分享音频"）</span></template>
       </div>
 
       <el-divider />
@@ -59,11 +72,12 @@
 
 <script setup>
 import { ref, onMounted, onUnmounted, nextTick } from 'vue'
-import { Microphone, VideoPause } from '@element-plus/icons-vue'
+import { Microphone, VideoPause, Monitor } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 
 const wsConnected = ref(false)
 const isRecording = ref(false)
+const inputSource = ref('microphone')
 const transcriptHistory = ref([])
 const transcriptBox = ref(null)
 
@@ -75,8 +89,8 @@ let source = null
 
 // Initialize WebSocket connection to backend
 const initWebSocket = () => {
-  // Assuming frontend is essentially same host but different port, hardcoding for local dev
-  const wsUrl = `ws://localhost:8000/api/ws/recognize`
+  // Use the current window's hostname so LAN devices can connect
+  const wsUrl = `ws://${window.location.hostname}:8000/api/ws/recognize`
   
   ws = new WebSocket(wsUrl)
   
@@ -131,54 +145,78 @@ const resampleAudioBuffer = async (audioBuffer, targetSampleRate) => {
     return await offlineCtx.startRendering();
 }
 
+const startAudioProcessing = (stream) => {
+  audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
+  source = audioContext.createMediaStreamSource(stream)
+  processor = audioContext.createScriptProcessor(4096, 1, 1)
+
+  source.connect(processor)
+  processor.connect(audioContext.destination)
+
+  processor.onaudioprocess = (e) => {
+    if (!isRecording.value || !wsConnected.value) return
+    const float32Array = e.inputBuffer.getChannelData(0)
+    const int16Array = new Int16Array(float32Array.length)
+    for (let i = 0; i < float32Array.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32Array[i]))
+      int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(int16Array.buffer)
+    }
+  }
+
+  // 监听系统声音流结束（用户在弹窗中点了停止共享）
+  stream.getAudioTracks().forEach(track => {
+    track.onended = () => {
+      if (isRecording.value) stopRecording()
+    }
+  })
+
+  mediaRecorder = stream
+  isRecording.value = true
+}
+
 const startRecording = async () => {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ 
-      audio: {
-        channelCount: 1, // Mono
-        echoCancellation: true,
-        noiseSuppression: true
-      } 
-    })
-    
-    // Use Web Audio API to capture raw PCM instead of compressed MediaRecorder formats
-    // to bypass the need for FFmpeg on the backend.
-    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
-    source = audioContext.createMediaStreamSource(stream)
-    
-    // We want relatively large chunks for VAD processing (e.g. 512-4096 samples)
-    // 4096 / 16000 is about 256ms chunk size. 
-    processor = audioContext.createScriptProcessor(4096, 1, 1)
-    
-    source.connect(processor)
-    processor.connect(audioContext.destination)
-    
-    processor.onaudioprocess = (e) => {
-      if (!isRecording.value || !wsConnected.value) return
-      
-      const float32Array = e.inputBuffer.getChannelData(0)
-      
-      // Convert Float32Array (-1.0 to 1.0) to Int16Array (-32768 to 32767) for WebSocket transport
-      // Backend expects Int16 PCM array.
-      const int16Array = new Int16Array(float32Array.length)
-      for (let i = 0; i < float32Array.length; i++) {
-        let s = Math.max(-1, Math.min(1, float32Array[i]))
-        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+    if (inputSource.value === 'microphone') {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
+      })
+      startAudioProcessing(stream)
+      ElMessage.success('麦克风启动成功')
+    } else {
+      // 捕获系统/标签页声音，Chrome 下需在弹窗中手动勾选"分享音频"
+      // 注：大多数浏览器要求 video 不能为 false，获取后立即停止视频轨道
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: {
+          channelCount: 1,
+          echoCancellation: false,
+          noiseSuppression: false
+        }
+      })
+      // 立即停止视频轨道，只保留音频
+      stream.getVideoTracks().forEach(t => t.stop())
+      if (!stream.getAudioTracks().length) {
+        stream.getTracks().forEach(t => t.stop())
+        ElMessage.warning('未检测到音频轨道，请在弹窗中勾选"分享音频"后重试')
+        return
       }
-      
-      if (ws && ws.readyState === WebSocket.OPEN) {
-         ws.send(int16Array.buffer)
-      }
+      startAudioProcessing(stream)
+      ElMessage.success('系统声音捕获启动成功')
     }
-    
-    // Keep a reference to stop later
-    mediaRecorder = stream
-    isRecording.value = true
-    ElMessage.success('Microphone started')
-    
   } catch (err) {
-    console.error('Error accessing microphone:', err)
-    ElMessage.error('Microphone access denied or not available')
+    if (err.name === 'NotAllowedError') {
+      ElMessage.error('用户取消或拒绝了权限请求')
+    } else {
+      console.error('Error starting recording:', err)
+      ElMessage.error('启动失败：' + err.message)
+    }
   }
 }
 
@@ -248,7 +286,13 @@ onUnmounted(() => {
 .controls {
   display: flex;
   justify-content: center;
-  margin: 30px 0;
+  margin: 20px 0;
+}
+
+.source-selector {
+  display: flex;
+  justify-content: center;
+  margin: 20px 0 0;
 }
 
 .recording-indicator {
@@ -260,6 +304,12 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.source-tip {
+  color: #909399;
+  font-size: 0.82rem;
 }
 
 .dot {

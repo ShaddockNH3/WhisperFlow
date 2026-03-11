@@ -15,14 +15,20 @@ from ai.llm.corrector import LLMCorrector
 class AIPipeline:
     def __init__(self, 
                  denoise_model_path: str = 'ai/denoise/weights/denoise_crnn.pt',
-                 whisper_model_id: str = "openai/whisper-small",
+                 whisper_model_id: str = "openai/whisper-turbo",
                  llm_model_id: str = "qwen/Qwen-1_8B-Chat",
                  use_llm: bool = True):
         print("Initializing AI Pipeline...")
+        
+        # Resolve relative model path based on project root to allow starting backend from /backend dir
+        if not os.path.isabs(denoise_model_path):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            denoise_model_path = os.path.join(project_root, denoise_model_path)
+            
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 1. Initialize VAD
-        self.vad = VADDetector(threshold=0.3, min_silence_duration_ms=400, sample_rate=16000)
+        # 1. Initialize VAD (using softer threshold to avoid word clipping)
+        self.vad = VADDetector(threshold=0.15, min_silence_duration_ms=600, sample_rate=16000)
         
         # 2. Initialize Denoise Model
         self.denoise_model = DenoiseCRNN().to(self.device)

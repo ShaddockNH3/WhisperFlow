@@ -10,6 +10,8 @@ from pathlib import Path
 # Configuration
 APP_NAME = "WhisperFlow"
 VERSION = "v1.0.0"
+# Increment this whenever the deps list below changes, to force re-install on existing runtimes.
+DEPS_VERSION = "2"
 DATA_DIR = Path(sys.executable).parent / "data"
 RUNTIME_DIR = DATA_DIR / "runtime"
 MODELS_DIR = DATA_DIR / "models"
@@ -27,95 +29,109 @@ def report_progress(count, block_size, total_size):
     sys.stdout.write(f"\rDownloading Runtime (Python 3.12.3)... {percent}%")
     sys.stdout.flush()
 
+def _install_deps():
+    """Install / upgrade all Python dependencies into the portable runtime."""
+    print("Installing AI libraries using uv (this may take a while on first run)...")
+    uv_cache = DATA_DIR / "uv_cache"
+    uv_cache.mkdir(parents=True, exist_ok=True)
+
+    deps = [
+        "fastapi", "uvicorn", "python-multipart", "pydantic", "aiofiles",
+        "torch", "torchaudio",
+        "faster-whisper", "onnxruntime", "python-dotenv", "websockets",
+        "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0",
+        "zhipuai>=2.1.0",
+    ]
+
+    env = os.environ.copy()
+    env["UV_CACHE_DIR"] = str(uv_cache)
+
+    cmd = [
+        str(PYTHON_EXE), "-m", "uv", "pip", "install",
+        "--index-url", "https://pypi.org/simple",
+        "--extra-index-url", "https://download.pytorch.org/whl/cpu"
+    ] + deps
+
+    subprocess.run(cmd, env=env, check=True)
+
+    # Record the deps version so we can skip this step on the next launch.
+    (DATA_DIR / "deps_version.txt").write_text(DEPS_VERSION)
+    print("\n--- Dependencies up to date. ---")
+
+
 def setup_runtime():
-    if PYTHON_EXE.exists():
+    deps_version_file = DATA_DIR / "deps_version.txt"
+    needs_python = not PYTHON_EXE.exists()
+    needs_deps = needs_python or not deps_version_file.exists() or deps_version_file.read_text().strip() != DEPS_VERSION
+
+    if not needs_python and not needs_deps:
         return True
 
-    print(f"--- {APP_NAME} First Run Setup ---")
-    print(f"Installing isolated Python 3.12.3 environment into {RUNTIME_DIR}...")
-    
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    if needs_python:
+        print(f"--- {APP_NAME} First Run Setup ---")
+        print(f"Installing isolated Python 3.12.3 environment into {RUNTIME_DIR}...")
 
-    url = PYTHON_URLS.get(sys.platform if sys.platform == "win32" else "linux")
-    if not url:
-        print(f"Unsupported platform: {sys.platform}")
-        return False
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    temp_file = DATA_DIR / ("python_runtime.zip" if sys.platform == "win32" else "python_runtime.tar.gz")
-    
+        url = PYTHON_URLS.get(sys.platform if sys.platform == "win32" else "linux")
+        if not url:
+            print(f"Unsupported platform: {sys.platform}")
+            return False
+
+        temp_file = DATA_DIR / ("python_runtime.zip" if sys.platform == "win32" else "python_runtime.tar.gz")
+
+        try:
+            urllib.request.urlretrieve(url, temp_file, reporthook=report_progress)
+            print("\nExtracting environment...")
+
+            if sys.platform == "win32":
+                with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                    zip_ref.extractall(RUNTIME_DIR)
+
+                # Windows Embeddable Python Fix: Enable site-packages
+                pth_file = RUNTIME_DIR / "python312._pth"
+                if pth_file.exists():
+                    with open(pth_file, "w") as f:
+                        # Overwrite to ensure standard imports work
+                        f.write(".\n")
+                        f.write("python312.zip\n")
+                        f.write("Lib/site-packages\n")
+                        f.write("import site\n")
+                (RUNTIME_DIR / "Lib/site-packages").mkdir(parents=True, exist_ok=True)
+            else:
+                with tarfile.open(temp_file, "r:gz") as tar_ref:
+                    tar_ref.extractall(DATA_DIR)
+                    extracted_dir = DATA_DIR / "python"
+                    if extracted_dir.exists():
+                        if RUNTIME_DIR.exists():
+                            shutil.rmtree(RUNTIME_DIR)
+                        shutil.move(extracted_dir, RUNTIME_DIR)
+
+            temp_file.unlink()
+
+            print("Installing package manager (pip & uv for speed)...")
+            pip_script = DATA_DIR / "get-pip.py"
+            urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", pip_script)
+            subprocess.run([str(PYTHON_EXE), str(pip_script), "--no-warn-script-location"], check=True)
+            pip_script.unlink()
+
+            subprocess.run([str(PYTHON_EXE), "-m", "pip", "install", "uv", "--no-warn-script-location"], check=True)
+
+        except Exception as e:
+            print(f"\nError during runtime setup: {e}")
+            return False
+
     try:
-        urllib.request.urlretrieve(url, temp_file, reporthook=report_progress)
-        print("\nExtracting environment...")
-        
-        if sys.platform == "win32":
-            with zipfile.ZipFile(temp_file, 'r') as zip_ref:
-                zip_ref.extractall(RUNTIME_DIR)
-            
-            # Windows Embeddable Python Fix: Enable site-packages
-            pth_file = RUNTIME_DIR / "python312._pth"
-            if pth_file.exists():
-                with open(pth_file, "w") as f:
-                    # Overwrite to ensure standard imports work
-                    f.write(".\n")
-                    f.write("python312.zip\n")
-                    f.write("Lib/site-packages\n")
-                    f.write("import site\n")
-            (RUNTIME_DIR / "Lib/site-packages").mkdir(parents=True, exist_ok=True)
-        else:
-            with tarfile.open(temp_file, "r:gz") as tar_ref:
-                tar_ref.extractall(DATA_DIR)
-                extracted_dir = DATA_DIR / "python"
-                if extracted_dir.exists():
-                    if RUNTIME_DIR.exists():
-                        shutil.rmtree(RUNTIME_DIR)
-                    shutil.move(extracted_dir, RUNTIME_DIR)
-
-        temp_file.unlink()
-        
-        print("Installing package manager (pip & uv for speed)...")
-        pip_script = DATA_DIR / "get-pip.py"
-        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", pip_script)
-        subprocess.run([str(PYTHON_EXE), str(pip_script), "--no-warn-script-location"], check=True)
-        pip_script.unlink()
-
-        # Install uv to speed up the rest of the installations
-        subprocess.run([str(PYTHON_EXE), "-m", "pip", "install", "uv", "--no-warn-script-location"], check=True)
-
-        print("Downloading AI libraries using uv (this will be much faster)...")
-        # Ensure uv uses a local cache directory for zero-trace
-        uv_cache = DATA_DIR / "uv_cache"
-        uv_cache.mkdir(parents=True, exist_ok=True)
-        
-        deps = [
-            "fastapi", "uvicorn", "python-multipart", "pydantic", "aiofiles",
-            "torch", "torchaudio", # uv handles index-url better if passed as args or in requirements
-            "faster-whisper", "onnxruntime", "python-dotenv", "websockets",
-            "opencc-python-reimplemented", "soundfile", "librosa", "numpy<2.0.0",
-            "zhipuai>=2.1.0",
-        ]
-        
-        # Use uv pip install for speed
-        env = os.environ.copy()
-        env["UV_CACHE_DIR"] = str(uv_cache)
-        
-        cmd = [
-            str(PYTHON_EXE), "-m", "uv", "pip", "install",
-            "--index-url", "https://pypi.org/simple",
-            "--extra-index-url", "https://download.pytorch.org/whl/cpu"
-        ] + deps
-        
-        subprocess.run(cmd, env=env, check=True)
-        
-        # Cleanup uv cache if you want to be super lightweight, 
-        # but keeping it makes future updates faster.
-        # shutil.rmtree(uv_cache) 
-        
-        print("\n--- Setup Complete! WhisperFlow is ready. ---")
-        return True
+        if needs_deps:
+            print(f"--- Updating dependencies (version {DEPS_VERSION}) ---")
+            _install_deps()
     except Exception as e:
-        print(f"\nError during isolation setup: {e}")
+        print(f"\nError during dependency installation: {e}")
         return False
+
+    print("\n--- Setup Complete! WhisperFlow is ready. ---")
+    return True
 
 def launch_backend():
     print(f"Starting {APP_NAME}...")

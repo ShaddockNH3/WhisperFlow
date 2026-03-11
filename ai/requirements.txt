@@ -1,0 +1,14 @@
+# AI Module Dependencies for WhisperFlow
+
+# Stage 1: Denoising (PyTorch CRNN)
+torch>=2.0.0
+torchaudio>=2.0.0
+librosa>=0.10.0
+soundfile>=0.12.1
+
+# Stage 2: VAD (Silero ONNX)
+onnxruntime>=1.15.0
+
+# Stage 3: Transcription & Correction (Whisper / LLM)
+transformers>=4.30.0
+accelerate>=0.20.0

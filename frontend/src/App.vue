@@ -64,27 +64,29 @@
       <div class="transcription-area">
         <h3>Live Transcription</h3>
         <div class="transcript-box" ref="transcriptBox">
-          <div v-if="transcriptHistory.length === 0 && !currentPartial" class="empty-state">
+          <div v-if="transcriptHistory.length === 0" class="empty-state">
             开始录音后此处将显示识别结果...
           </div>
           <div v-else class="transcript-list">
-             <div v-for="(item, index) in transcriptHistory" :key="index" class="transcript-item"
-               :class="{ 'transcript-item--streaming': item.streaming }">
-                <!-- 流式期间：只显示正在生成的 LLM 文本（从空开始逐字填入），不展示原始行 -->
-                <!-- 完成后：显示纠错文本，若与原始不同则在下方显示原始供参考 -->
-                <div class="corrected-text">
-                  {{ item.corrected_text }}<span v-if="item.streaming" class="cursor">|</span>
-                </div>
-                <div class="raw-text"
-                  v-if="!item.usedLLM && !item.streaming && item.corrected_text !== item.raw_text"
-                  title="Whisper 原始识别">
-                  原始：{{ item.raw_text }}
-                </div>
-             </div>
-             <!-- 语音预览行（VAD 缓冲中） -->
-             <div v-if="currentPartial" class="transcript-item transcript-item--partial">
-               <div class="corrected-text">{{ currentPartial }}<span class="cursor">|</span></div>
-             </div>
+            <div v-for="item in transcriptHistory" :key="item.segment_id" class="transcript-item"
+              :class="{
+                'transcript-item--partial': item.status === 'partial',
+                'transcript-item--pending': item.status === 'whisper_done',
+                'transcript-item--final-llm': item.status === 'final' && item.raw_text !== item.corrected_text,
+                'transcript-item--sentence-open': item.status === 'sentence_open'
+              }">
+              <div class="corrected-text"
+                :class="{
+                  'text--gray': item.status === 'partial' || item.status === 'whisper_done',
+                  'text--underline': item.status === 'partial'
+                }">
+                {{ item.corrected_text }}<span v-if="item.status === 'partial'" class="cursor">|</span>
+              </div>
+              <div v-if="item.status === 'final' && item.raw_text !== item.corrected_text"
+                class="raw-text" title="Whisper 原始识别">
+                原始：{{ item.raw_text }}
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -102,10 +104,13 @@ const isRecording = ref(false)
 const inputSource = ref('microphone')
 const useLLM = ref(true)
 const transcriptHistory = ref([])
-const currentPartial = ref('')
 const transcriptBox = ref(null)
-// Accumulates LLM tokens silently until llm_done, then replaces the Whisper text
+// Accumulates LLM tokens for the current segment until llm_done
 const llmBuffer = ref('')
+// segment_id of the currently open (sentence-incomplete) display entry
+const currentOpenId = ref(null)
+// Most recent backend segment_id feeding into the open entry
+const latestBackendSegId = ref(null)
 
 let ws = null
 let mediaRecorder = null
@@ -129,38 +134,105 @@ const initWebSocket = () => {
     try {
       const data = JSON.parse(event.data)
 
-      if (data.type === 'transcription_raw') {
-        currentPartial.value = ''
+      if (data.type === 'partial') {
+        // 若 LLM 模式下已有未关闭的句子，忽略 partial 预览（避免创建多余文本框）
+        if (useLLM.value && currentOpenId.value) {
+          scrollToBottom()
+          return
+        }
+        const existing = transcriptHistory.value.find(i => i.segment_id === data.segment_id)
+        if (existing) {
+          existing.corrected_text = data.text
+          existing.raw_text = data.text
+        } else {
+          transcriptHistory.value.push({
+            segment_id: data.segment_id,
+            raw_text: data.text,
+            corrected_text: data.text,
+            corrected_base: '',
+            status: 'partial',
+          })
+        }
+        scrollToBottom()
+
+      } else if (data.type === 'transcription_raw') {
         llmBuffer.value = ''
-        // 立即显示 Whisper 输出；若开启 LLM 则保持 streaming 光标表示正在纠错
-        transcriptHistory.value.push({
-          raw_text: data.raw_text,
-          corrected_text: data.raw_text,
-          streaming: useLLM.value,
-          usedLLM: false
-        })
+
+        if (useLLM.value && currentOpenId.value) {
+          // ── 有未关闭句子：追加到现有文本框，不新建 ──
+          const entry = transcriptHistory.value.find(i => i.segment_id === currentOpenId.value)
+          if (entry) {
+            // 保存本次新片段开始前已稳定的纠错文本，供 llm_done 时拼接
+            entry.corrected_base = entry.corrected_text
+            entry.raw_text = (entry.raw_text + data.raw_text).trim()
+            // 先用 "已纠错 + 原始新片段" 展示，等 LLM 完成后再替换
+            entry.corrected_text = (entry.corrected_base + data.raw_text).trim()
+            entry.status = 'whisper_done'
+          }
+          latestBackendSegId.value = data.segment_id
+        } else {
+          // ── 新建文本框 ──
+          // 清理可能残留的、属于其他 segment 的 partial 预览条目
+          const staleIdx = transcriptHistory.value.findLastIndex(
+            i => i.status === 'partial' && i.segment_id !== data.segment_id
+          )
+          if (staleIdx !== -1) transcriptHistory.value.splice(staleIdx, 1)
+
+          const nextStatus = useLLM.value ? 'whisper_done' : 'final'
+          const existing = transcriptHistory.value.find(i => i.segment_id === data.segment_id)
+          if (existing) {
+            existing.raw_text = data.raw_text
+            existing.corrected_text = data.raw_text
+            existing.corrected_base = ''
+            existing.status = nextStatus
+          } else {
+            transcriptHistory.value.push({
+              segment_id: data.segment_id,
+              raw_text: data.raw_text,
+              corrected_text: data.raw_text,
+              corrected_base: '',
+              status: nextStatus,
+            })
+          }
+          if (useLLM.value) {
+            currentOpenId.value = data.segment_id
+            latestBackendSegId.value = data.segment_id
+          }
+        }
         scrollToBottom()
 
       } else if (data.type === 'llm_token') {
-        // 静默累积，不更新显示，等 llm_done 后一次性替换
-        llmBuffer.value += data.token
-
-      } else if (data.type === 'llm_done') {
-        const last = transcriptHistory.value[transcriptHistory.value.length - 1]
-        if (last && last.streaming) {
-          if (llmBuffer.value.trim()) {
-            // 用完整的 LLM 输出一次性覆盖 Whisper 文本
-            last.corrected_text = llmBuffer.value.trim()
-            last.usedLLM = true
-          }
-          last.streaming = false
-          llmBuffer.value = ''
-          scrollToBottom()
+        // 仅接收最新片段的 token，忽略已过期片段的流式响应
+        if (data.segment_id === latestBackendSegId.value) {
+          llmBuffer.value += data.token
         }
 
-      } else if (data.type === 'partial') {
-        currentPartial.value = data.text
-        scrollToBottom()
+      } else if (data.type === 'llm_done') {
+        // 忽略过期片段的 LLM 响应（用户已说出更多内容）
+        if (data.segment_id !== latestBackendSegId.value) {
+          return
+        }
+
+        const item = transcriptHistory.value.find(i => i.segment_id === currentOpenId.value)
+        if (item) {
+          const correctedFragment = (data.corrected_text || llmBuffer.value).trim()
+          if (correctedFragment) {
+            // 拼接：上一次稳定的纠错文本 + 本次片段的纠错结果
+            item.corrected_text = item.corrected_base
+              ? (item.corrected_base + correctedFragment).trim()
+              : correctedFragment
+          }
+          const isSentenceEnd = /[。！？…]$/.test(item.corrected_text)
+          if (isSentenceEnd) {
+            item.status = 'final'
+            currentOpenId.value = null
+            latestBackendSegId.value = null
+          } else {
+            item.status = 'sentence_open'
+          }
+          scrollToBottom()
+        }
+        llmBuffer.value = ''
 
       } else if (data.type === 'error') {
         ElMessage.error(data.message)
@@ -276,7 +348,14 @@ const startRecording = async () => {
 
 const stopRecording = () => {
   isRecording.value = false
-  currentPartial.value = ''
+  llmBuffer.value = ''
+  // 停止录音时关闭任何未完成的句子
+  if (currentOpenId.value) {
+    const item = transcriptHistory.value.find(i => i.segment_id === currentOpenId.value)
+    if (item) item.status = 'final'
+    currentOpenId.value = null
+    latestBackendSegId.value = null
+  }
   
   if (processor) {
     processor.disconnect()
@@ -299,6 +378,13 @@ const stopRecording = () => {
 const onUseLLMChange = (val) => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'set_use_llm', value: val }))
+  }
+  // 关闭 LLM 时立即封闭当前开放句子
+  if (!val && currentOpenId.value) {
+    const item = transcriptHistory.value.find(i => i.segment_id === currentOpenId.value)
+    if (item) item.status = 'final'
+    currentOpenId.value = null
+    latestBackendSegId.value = null
   }
 }
 
@@ -427,11 +513,37 @@ onUnmounted(() => {
 
 .transcript-item--partial {
   border-left-color: #e6a23c;
+  opacity: 0.9;
+}
+
+.transcript-item--pending {
+  border-left-color: #909399;
   opacity: 0.85;
+}
+
+.transcript-item--final-llm {
+  border-left-color: #67c23a;
 }
 
 .transcript-item--streaming {
   border-left-color: #67c23a;
+}
+
+/* Sentence flagged as incomplete by LLM (no '。' at end) */
+.transcript-item--sentence-open {
+  border-left-color: #e6a23c;
+  border-left-style: dashed;
+}
+
+/* Gray text for partial/whisper_done states */
+.text--gray {
+  color: #909399;
+}
+
+/* Underline dashes for partial (still being updated live) */
+.text--underline {
+  text-decoration: underline dotted #e6a23c;
+  text-underline-offset: 3px;
 }
 
 .waiting-indicator {

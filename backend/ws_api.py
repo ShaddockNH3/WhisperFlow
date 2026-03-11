@@ -107,28 +107,30 @@ async def websocket_recognize(websocket: WebSocket):
                     last_interim_time = 0.0
 
                     raw_text = result.get("raw_text", "")
+                    segment_id = result.get("segment_id", "")
 
-                    # Always send raw result immediately
+                    # Send Whisper result — frontend shows this as gray (awaiting LLM)
                     await websocket.send_json({
                         "type": "transcription_raw",
+                        "segment_id": segment_id,
                         "raw_text": raw_text,
                     })
 
                     # Optionally start streaming LLM correction
                     if use_llm and raw_text.strip():
                         llm_task = asyncio.create_task(
-                            _stream_llm(websocket, pipeline, raw_text)
+                            _stream_llm(websocket, pipeline, raw_text, segment_id)
                         )
                 else:
                     # Interim partial preview
                     now = time.monotonic()
                     if now - last_interim_time >= INTERIM_INTERVAL_S:
-                        snapshot = pipeline.get_buffer_snapshot()
+                        snapshot, seg_id = pipeline.get_buffer_snapshot()
                         if snapshot is not None and len(snapshot) >= MIN_INTERIM_SAMPLES:
                             last_interim_time = now
                             if partial_task is None or partial_task.done():
                                 partial_task = asyncio.create_task(
-                                    _send_partial(websocket, pipeline, snapshot)
+                                    _send_partial(websocket, pipeline, snapshot, seg_id)
                                 )
 
             except Exception as e:
@@ -146,12 +148,19 @@ async def websocket_recognize(websocket: WebSocket):
                 print(f"Final phrase (disconnected): {final_result.get('raw_text')}")
 
 
-async def _stream_llm(websocket: WebSocket, pipeline, raw_text: str):
+async def _stream_llm(websocket: WebSocket, pipeline, raw_text: str, segment_id: str):
     """Run LLM correction stream and push each token to the frontend."""
     loop = asyncio.get_event_loop()
+    collected_tokens = []
     try:
         gen = await loop.run_in_executor(_executor, pipeline.correct_stream, raw_text)
         if gen is None:
+            # LLM disabled — mark segment as final with the raw text
+            await websocket.send_json({
+                "type": "llm_done",
+                "segment_id": segment_id,
+                "corrected_text": raw_text,
+            })
             return
         # Iterate the synchronous generator in the thread pool token by token.
         # Use _safe_next to avoid StopIteration escaping into asyncio Future machinery.
@@ -159,22 +168,32 @@ async def _stream_llm(websocket: WebSocket, pipeline, raw_text: str):
             token = await loop.run_in_executor(_executor, _safe_next, gen)
             if token is _STOP:
                 break
-            await websocket.send_json({"type": "llm_token", "token": token})
-        await websocket.send_json({"type": "llm_done"})
+            collected_tokens.append(token)
+            await websocket.send_json({"type": "llm_token", "segment_id": segment_id, "token": token})
+        corrected_text = "".join(collected_tokens).strip() or raw_text
+        await websocket.send_json({
+            "type": "llm_done",
+            "segment_id": segment_id,
+            "corrected_text": corrected_text,
+        })
     except asyncio.CancelledError:
         pass
     except Exception as e:
         print(f"LLM stream error: {e}")
 
 
-async def _send_partial(websocket: WebSocket, pipeline, audio: np.ndarray):
+async def _send_partial(websocket: WebSocket, pipeline, audio: np.ndarray, segment_id: str):
     """Run a quick (no-LLM) transcription in the thread pool and send as a partial preview."""
     loop = asyncio.get_event_loop()
     try:
         # Use the same single-thread pipeline executor to serialise Whisper access
         text = await loop.run_in_executor(_pipeline_executor, pipeline.quick_transcribe, audio)
         if text and text.strip():
-            await websocket.send_json({"type": "partial", "text": text})
+            await websocket.send_json({
+                "type": "partial",
+                "segment_id": segment_id,
+                "text": text,
+            })
     except asyncio.CancelledError:
         pass  # Superseded by a committed phrase — silently discard
     except Exception as e:

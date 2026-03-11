@@ -28,8 +28,8 @@ class AIPipeline:
             
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 1. Initialize VAD (using softer threshold to avoid word clipping)
-        self.vad = VADDetector(threshold=0.15, min_silence_duration_ms=600, sample_rate=16000)
+        # 1. Initialize VAD — silence threshold and max duration are managed dynamically
+        self.vad = VADDetector(threshold=0.15, sample_rate=16000)
         
         # 2. Initialize Denoise Model
         self.denoise_model = DenoiseCRNN().to(self.device)
@@ -60,18 +60,19 @@ class AIPipeline:
         Returns a dictionary with results if a phrase was completed, otherwise None.
         """
         # 1. VAD to check for phrase boundaries
-        phrase = self.vad.process_chunk(audio_chunk)
+        vad_result = self.vad.process_chunk(audio_chunk)
         
-        if phrase is not None:
-            return self._process_phrase(phrase)
+        if vad_result is not None:
+            phrase, segment_id = vad_result
+            return self._process_phrase(phrase, segment_id)
             
         return None
         
-    def get_buffer_snapshot(self) -> np.ndarray | None:
-        """Returns a copy of the current VAD audio buffer without consuming it."""
+    def get_buffer_snapshot(self) -> tuple[np.ndarray, str] | tuple[None, None]:
+        """Returns a copy of the current VAD audio buffer and its segment_id without consuming it."""
         if not self.vad.buffer:
-            return None
-        return np.concatenate(self.vad.buffer)
+            return None, None
+        return np.concatenate(self.vad.buffer), self.vad.current_segment_id
 
     def quick_transcribe(self, audio: np.ndarray) -> str:
         """Denoise + transcribe only (no LLM correction), used for interim partial results."""
@@ -83,14 +84,15 @@ class AIPipeline:
 
     def force_emit(self):
         """Forces the VAD to emit whatever is in its buffer."""
-        phrase = self.vad.force_emit()
-        if phrase is not None:
-            return self._process_phrase(phrase)
+        vad_result = self.vad.force_emit()
+        if vad_result is not None:
+            phrase, segment_id = vad_result
+            return self._process_phrase(phrase, segment_id)
         return None
 
-    def _process_phrase(self, phrase: np.ndarray):
+    def _process_phrase(self, phrase: np.ndarray, segment_id: str):
         """Internal method to process a complete continuous speech phrase."""
-        result = {}
+        result = {'segment_id': segment_id}
         
         # 2. Denoise
         denoised_phrase = denoise_array(self.denoise_model, phrase, sr=16000)

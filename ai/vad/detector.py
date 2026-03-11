@@ -1,107 +1,214 @@
 import torch
-import torchaudio
 import numpy as np
-import os
+import uuid
+
 
 class VADDetector:
     """
-    Wrapper for Silero VAD (Voice Activity Detection).
-    Handles dynamic audio streaming, silence detection, and chunking.
+    Wrapper for Silero VAD with two ultra-long utterance defence strategies:
+
+    Strategy 1 — Dynamic silence threshold
+        The longer the user has been speaking without a cut, the more aggressively
+        we look for a silence boundary:
+            0 – 5 s   buffered → 800 ms silence triggers cut  (full sentence context)
+            5 – 10 s  buffered → 300 ms silence triggers cut  (catch micro-pauses)
+            10 s+     buffered → 100 ms silence triggers cut  (grab any valley)
+
+    Strategy 2 — Soft max-duration cut (default 15 s)
+        When the buffer hits the hard cap we never cut blindly at the current frame.
+        Instead, we look back over the most recent `lookback_s` seconds and find
+        the frame whose VAD probability is the local minimum (most natural pause).
+        If all frames in the lookback window are above the speech threshold we fall
+        back to the minimum-RMS frame to avoid splitting a phoneme.
     """
-    def __init__(self, threshold: float = 0.3, min_silence_duration_ms: int = 400, sample_rate: int = 16000):
+
+    # (max_buffered_seconds, silence_threshold_ms)  — checked in order
+    SILENCE_TIERS: list[tuple[float, int]] = [
+        (5.0,          200),
+        (10.0,         120),
+        (float("inf"), 60),
+    ]
+
+    def __init__(
+        self,
+        threshold: float = 0.15,
+        sample_rate: int = 16000,
+        max_speech_duration_s: float = 10.0,
+        soft_cut_interval_s: float = 3.0,
+        lookback_s: float = 1.5,
+    ):
         self.sample_rate = sample_rate
         self.threshold = threshold
-        # Convert ms silence duration to number of samples (since VAD output is granular)
-        self.min_silence_samples = int((min_silence_duration_ms / 1000.0) * sample_rate)
-        
-        # Load the PyTorch Hub version of Silero VAD (which resolves to JS/ONNX under the hood if needed)
-        # Using torch.hub guarantees we get the optimized JIT version
+        self.max_speech_samples = int(max_speech_duration_s * sample_rate)
+        # Proactive soft-cut: if no silence-triggered cut has happened within this
+        # many samples of continuous speech, find the local minimum and cut anyway.
+        self.soft_cut_interval_samples = int(soft_cut_interval_s * sample_rate)
+        # Number of samples to scan backwards when doing a soft-cut
+        self.lookback_samples = int(lookback_s * sample_rate)
+        # Samples accumulated since the last cut (either silence or soft-cut)
+        self._samples_since_cut: int = 0
+
         print("Loading Silero VAD model from Torch Hub...")
-        self.model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad',
-                                           model='silero_vad',
-                                           force_reload=False)
-                                           
-        (self.get_speech_timestamps,
-         self.save_audio,
-         self.read_audio,
-         self.VADIterator,
-         self.collect_chunks) = utils
-         
+        self.model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+        )
+        (
+            self.get_speech_timestamps,
+            self.save_audio,
+            self.read_audio,
+            self.VADIterator,
+            self.collect_chunks,
+        ) = utils
         self.model.eval()
-        
-        # Tracking states for streaming
-        self.buffer = []
-        self.silence_accumulator = 0  # Number of silent samples currently tracked
-        self.is_speaking = False
-        
-    def _array_to_tensor(self, audio_chunk: np.ndarray) -> torch.Tensor:
-        """Convert incoming numpy float32 chunk (-1.0 to 1.0) to torch tensor."""
-        if audio_chunk.dtype != np.float32:
-            audio_chunk = audio_chunk.astype(np.float32)
-        return torch.from_numpy(audio_chunk)
-        
-    def process_chunk(self, audio_chunk: np.ndarray):
+
+        # Streaming state
+        self.buffer: list[np.ndarray] = []
+        self.vad_probs: list[float] = []
+        self.silence_accumulator: int = 0   # consecutive silent samples
+        self.is_speaking: bool = False
+        self.current_segment_id: str = ""
+        self._samples_since_cut: int = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _to_tensor(self, chunk: np.ndarray) -> torch.Tensor:
+        if chunk.dtype != np.float32:
+            chunk = chunk.astype(np.float32)
+        return torch.from_numpy(chunk)
+
+    def _dynamic_silence_samples(self) -> int:
+        """Return the current silence-trigger threshold (samples) based on how much
+        speech is already buffered (Strategy 1)."""
+        buffered_s = sum(c.shape[0] for c in self.buffer) / self.sample_rate
+        for max_s, silence_ms in self.SILENCE_TIERS:
+            if buffered_s < max_s:
+                return int(silence_ms / 1000.0 * self.sample_rate)
+        return int(0.1 * self.sample_rate)  # unreachable, safety fallback
+
+    def _soft_cut_index(self) -> int:
+        """Find the best cut index within the last `lookback_samples` of the buffer
+        (Strategy 2).
+
+        Priority:
+          1. Frame with the lowest VAD probability below the speech threshold.
+          2. Frame with the lowest RMS energy (if all probs are above threshold).
+
+        Returns the index into self.buffer / self.vad_probs to cut *before*.
         """
-        Receives a continuous stream of audio chunks (e.g., 512 samples at a time).
-        Returns a complete phrase as a numpy array if a trailing silence is detected.
-        Otherwise, returns None, buffering the audio internally.
-        """
-        # 1. Append to internal buffer cache
-        self.buffer.append(audio_chunk)
-        
-        # 2. Run VAD on this specific chunk
-        tensor_chunk = self._array_to_tensor(audio_chunk)
-        
-        # Silero VAD processes blocks of 512 samples. 
-        # If the chunk is exactly 512, this works natively, otherwise we pad it.
-        # But for inference, `model(tensor_chunk)` directly returns a float probability
-        # In a real streaming scenario, we might use VADIterator, but for simplicity here
-        # we evaluate probabilities block by block.
-        
-        chunk_len = tensor_chunk.shape[0]
-        
-        # Make sure chunk is divisible by 512 for optimal Silero performance, 
-        # otherwise just pad temporarily (only for VAD check, buffer keeps original data).
-        if chunk_len < 512:
-            pad = torch.zeros(512 - chunk_len, dtype=torch.float32)
-            vad_tensor = torch.cat([tensor_chunk, pad])
+        # Determine how many tail-chunks span `lookback_samples`
+        lookback_chunks = 0
+        acc = 0
+        for sz in (c.shape[0] for c in reversed(self.buffer)):
+            acc += sz
+            lookback_chunks += 1
+            if acc >= self.lookback_samples:
+                break
+
+        search_start = max(0, len(self.buffer) - lookback_chunks)
+        search_probs = self.vad_probs[search_start:]
+
+        min_prob = min(search_probs)
+        if min_prob < self.threshold:
+            # A genuine low-activity frame exists → cut there
+            local_idx = int(np.argmin(search_probs))
         else:
-            vad_tensor = tensor_chunk[:512] # Just check the first 512 for this instant
-            
+            # All frames look like speech → fall back to minimum RMS
+            rms = [
+                float(np.sqrt(np.mean(self.buffer[search_start + i] ** 2)))
+                for i in range(len(search_probs))
+            ]
+            local_idx = int(np.argmin(rms))
+
+        return search_start + local_idx
+
+    def _emit(self, cut_idx: int | None = None) -> tuple[np.ndarray, str]:
+        """Consume the buffer up to `cut_idx` (exclusive) and return
+        (phrase_array, segment_id).  Pass None to consume the whole buffer.
+        Any audio after the cut point is kept for the next segment."""
+        if cut_idx is None:
+            phrase = np.concatenate(self.buffer)
+            seg_id = self.current_segment_id
+            self.buffer = []
+            self.vad_probs = []
+            self.silence_accumulator = 0
+            self.is_speaking = False
+            self.current_segment_id = ""
+        else:
+            phrase = np.concatenate(self.buffer[:cut_idx])
+            seg_id = self.current_segment_id
+            self.buffer = self.buffer[cut_idx:]
+            self.vad_probs = self.vad_probs[cut_idx:]
+            self.silence_accumulator = 0
+            # Continuous speech — open a new segment immediately
+            self.current_segment_id = uuid.uuid4().hex[:8]
+
+        self._samples_since_cut = 0
+        self.model.reset_states()
+        return phrase, seg_id
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def process_chunk(self, audio_chunk: np.ndarray):
+        """Receive one audio chunk (typically 512 samples, 16 kHz float32).
+
+        Returns (phrase_array, segment_id) when a phrase boundary is detected,
+        otherwise returns None.
+        """
+        self.buffer.append(audio_chunk)
+
+        # VAD inference — Silero expects exactly 512 samples; pad if shorter
+        tensor = self._to_tensor(audio_chunk)
+        chunk_len = tensor.shape[0]
+        if chunk_len < 512:
+            vad_tensor = torch.cat([tensor, torch.zeros(512 - chunk_len)])
+        else:
+            vad_tensor = tensor[:512]
+
         with torch.no_grad():
             speech_prob = self.model(vad_tensor, self.sample_rate).item()
-            
-        # 3. State Machine Logic
+
+        self.vad_probs.append(speech_prob)
+        self._samples_since_cut += chunk_len
+
         if speech_prob > self.threshold:
+            # ── Active speech ──────────────────────────────────────────
+            if not self.is_speaking:
+                self.current_segment_id = uuid.uuid4().hex[:8]
             self.is_speaking = True
             self.silence_accumulator = 0
+
+            buffered_samples = sum(c.shape[0] for c in self.buffer)
+
+            # Strategy 2a: absolute hard cap → soft-cut at local minimum
+            if buffered_samples >= self.max_speech_samples:
+                cut_idx = self._soft_cut_index()
+                return self._emit(cut_idx)
+
+            # Strategy 2b: proactive timed soft-cut — no silence detected for a while,
+            # find local minimum and cut anyway to keep Whisper inputs short.
+            if self._samples_since_cut >= self.soft_cut_interval_samples:
+                cut_idx = self._soft_cut_index()
+                return self._emit(cut_idx)
+
         else:
+            # ── Silent frame ───────────────────────────────────────────
             if self.is_speaking:
                 self.silence_accumulator += chunk_len
-                
-                # Check if silence limit is reached
-                if self.silence_accumulator >= self.min_silence_samples:
-                    # Target Reached! Cut the buffer and emit the phrase.
-                    phrase = np.concatenate(self.buffer)
-                    # Reset internal state
-                    self.buffer = []
-                    self.silence_accumulator = 0
-                    self.is_speaking = False
-                    
-                    # Reset VAD internal RNN states
-                    self.model.reset_states() 
-                    
-                    return phrase
-                    
+
+                # Strategy 1: dynamic silence threshold
+                if self.silence_accumulator >= self._dynamic_silence_samples():
+                    return self._emit(None)
+
         return None
 
     def force_emit(self):
-        """Forces the current buffer to emit regardless of silence (e.g. at end of connection)."""
-        if len(self.buffer) > 0:
-            phrase = np.concatenate(self.buffer)
-            self.buffer = []
-            self.silence_accumulator = 0
-            self.is_speaking = False
-            self.model.reset_states()
-            return phrase
+        """Force-emit whatever is buffered (e.g. on WebSocket close)."""
+        if self.buffer:
+            return self._emit(None)
         return None

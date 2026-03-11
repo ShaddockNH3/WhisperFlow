@@ -10,5 +10,8 @@ soundfile>=0.12.1
 onnxruntime>=1.15.0
 
 # Stage 3: Transcription & Correction (Whisper / LLM)
-transformers>=4.30.0
-accelerate>=0.20.0
+# Using faster-whisper (CTranslate2) instead of raw transformers for massive speedup
+faster-whisper>=1.0.0
+opencc-python-reimplemented>=0.1.7
+# ZhipuAI GLM-4-Flash-250414 for ASR correction
+zhipuai>=2.1.0

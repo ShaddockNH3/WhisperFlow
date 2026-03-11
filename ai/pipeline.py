@@ -1,5 +1,6 @@
 import os
 import sys
+import difflib
 import torch
 import numpy as np
 
@@ -15,14 +16,20 @@ from ai.llm.corrector import LLMCorrector
 class AIPipeline:
     def __init__(self, 
                  denoise_model_path: str = 'ai/denoise/weights/denoise_crnn.pt',
-                 whisper_model_id: str = "openai/whisper-small",
-                 llm_model_id: str = "qwen/Qwen-1_8B-Chat",
+                 whisper_model_id: str = "openai/whisper-turbo",
+                 llm_model_id: str = "glm-4-flash-250414",
                  use_llm: bool = True):
         print("Initializing AI Pipeline...")
+        
+        # Resolve relative model path based on project root to allow starting backend from /backend dir
+        if not os.path.isabs(denoise_model_path):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            denoise_model_path = os.path.join(project_root, denoise_model_path)
+            
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # 1. Initialize VAD
-        self.vad = VADDetector(threshold=0.3, min_silence_duration_ms=400, sample_rate=16000)
+        # 1. Initialize VAD — silence threshold and max duration are managed dynamically
+        self.vad = VADDetector(threshold=0.15, sample_rate=16000)
         
         # 2. Initialize Denoise Model
         self.denoise_model = DenoiseCRNN().to(self.device)
@@ -41,6 +48,9 @@ class AIPipeline:
         if self.use_llm:
             self.corrector = LLMCorrector(model_id=llm_model_id)
             self.historical_context = []
+
+        # Track the last committed text for deduplication
+        self._last_committed_text: str = ""
             
         print("AI Pipeline initialized successfully.")
 
@@ -50,48 +60,93 @@ class AIPipeline:
         Returns a dictionary with results if a phrase was completed, otherwise None.
         """
         # 1. VAD to check for phrase boundaries
-        phrase = self.vad.process_chunk(audio_chunk)
+        vad_result = self.vad.process_chunk(audio_chunk)
         
-        if phrase is not None:
-            return self._process_phrase(phrase)
+        if vad_result is not None:
+            phrase, segment_id = vad_result
+            return self._process_phrase(phrase, segment_id)
             
         return None
         
+    def get_buffer_snapshot(self) -> tuple[np.ndarray, str] | tuple[None, None]:
+        """Returns a copy of the current VAD audio buffer and its segment_id without consuming it."""
+        if not self.vad.buffer:
+            return None, None
+        return np.concatenate(self.vad.buffer), self.vad.current_segment_id
+
+    def quick_transcribe(self, audio: np.ndarray) -> str:
+        """Denoise + transcribe only (no LLM correction), used for interim partial results."""
+        denoised = denoise_array(self.denoise_model, audio, sr=16000)
+        max_val = np.max(np.abs(denoised))
+        if max_val > 0.0:
+            denoised = denoised / max_val
+        return self.transcriber.transcribe(denoised, sample_rate=16000)
+
     def force_emit(self):
         """Forces the VAD to emit whatever is in its buffer."""
-        phrase = self.vad.force_emit()
-        if phrase is not None:
-            return self._process_phrase(phrase)
+        vad_result = self.vad.force_emit()
+        if vad_result is not None:
+            phrase, segment_id = vad_result
+            return self._process_phrase(phrase, segment_id)
         return None
 
-    def _process_phrase(self, phrase: np.ndarray):
+    def _process_phrase(self, phrase: np.ndarray, segment_id: str):
         """Internal method to process a complete continuous speech phrase."""
-        result = {}
+        result = {'segment_id': segment_id}
         
         # 2. Denoise
-        # Call the standalone denoise function we refactored
         denoised_phrase = denoise_array(self.denoise_model, phrase, sr=16000)
         
         # Normalize the denoised audio to avoid clipping issues with Whisper
-        # (Optional but usually good practice after ISTFT)
         max_val = np.max(np.abs(denoised_phrase))
         if max_val > 0.0:
              denoised_phrase = denoised_phrase / max_val
              
         # 3. Transcribe
         raw_text = self.transcriber.transcribe(denoised_phrase, sample_rate=16000)
+
+        # Deduplication: discard if too similar to the last committed phrase.
+        # Similarity > 0.85 almost always means Whisper hallucinated the same sentence again.
+        if raw_text.strip():
+            similarity = difflib.SequenceMatcher(
+                None, raw_text.strip(), self._last_committed_text
+            ).ratio()
+            if similarity > 0.85:
+                return None  # silently discard the hallucinated repetition
+            self._last_committed_text = raw_text.strip()
+
         result['raw_text'] = raw_text
-        
-        # 4. LLM Correction
-        if self.use_llm and raw_text.strip():
-            corrected_text = self.corrector.correct(raw_text, self.historical_context)
-            result['corrected_text'] = corrected_text
-            
-            # Update history
-            self.historical_context.append(corrected_text)
-            if len(self.historical_context) > 10:  # Keep bounded
-                self.historical_context.pop(0)
-        else:
-            result['corrected_text'] = raw_text
+        result['corrected_text'] = raw_text  # default, overwritten if LLM is used
             
         return result
+
+    def correct_stream(self, raw_text: str):
+        """
+        Returns a streaming generator for LLM correction.
+        Also updates historical_context with the final result after iteration.
+        """
+        if not self.use_llm or not raw_text.strip():
+            return
+
+        collected = []
+
+        def _gen():
+            for token in self.corrector.correct_stream(raw_text, self.historical_context):
+                collected.append(token)
+                yield token
+            # Update history after stream completes, with deduplication guard.
+            corrected = "".join(collected).strip()
+            if not corrected:
+                return
+            # Discard if the corrected output is highly similar to any recent history entry
+            # (catches LLM hallucinations that reproduce previous context verbatim).
+            for prev in self.historical_context[-3:]:
+                sim = difflib.SequenceMatcher(None, corrected, prev).ratio()
+                if sim > 0.7:
+                    print(f"[LLM dedup] Discarding corrected output (similarity {sim:.2f} to history).")
+                    return
+            self.historical_context.append(corrected)
+            if len(self.historical_context) > 10:
+                self.historical_context.pop(0)
+
+        return _gen()

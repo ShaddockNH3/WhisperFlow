@@ -9,13 +9,16 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from .router import ws_router
+import router  # Fixed: Use direct import, launcher adds folder to PYTHONPATH
 
 # Load .env from 'data' folder next to executable for portability
-if getattr(sys, 'frozen', False):
-    app_root = os.path.dirname(sys.executable)
-else:
-    app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# We prefer the environment variable passed by our launcher
+app_root = os.environ.get("WHISPERFLOW_APP_ROOT")
+if not app_root:
+    if getattr(sys, 'frozen', False):
+        app_root = os.path.dirname(sys.executable)
+    else:
+        app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 env_path = os.path.join(app_root, "data", ".env")
 if os.path.exists(env_path):
@@ -38,7 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(ws_router, prefix="/api")
+app.include_router(router.ws_router, prefix="/api")
 
 # Resolve static files path for portable build
 if getattr(sys, 'frozen', False):

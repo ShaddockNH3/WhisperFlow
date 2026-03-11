@@ -118,13 +118,22 @@ def setup_runtime():
 
 def launch_backend():
     print(f"Starting {APP_NAME}...")
-    backend_script = Path(__file__).parent / "backend" / "main.py"
+    # Since launcher is bundled, __file__ points to the temp extraction dir
+    temp_dir = Path(__file__).parent
+    backend_script = temp_dir / "backend" / "main.py"
+    
+    # The real app folder where the .exe sits
+    real_app_root = Path(sys.executable).parent
     
     # Set environment variables for portability within the subprocess
     env = os.environ.copy()
+    env["WHISPERFLOW_APP_ROOT"] = str(real_app_root)
     env["HF_HOME"] = str(MODELS_DIR / "huggingface")
     env["XDG_CACHE_HOME"] = str(MODELS_DIR / "xdg")
     env["TORCH_HOME"] = str(MODELS_DIR / "torch")
+    
+    # Ensure backend folder is in PYTHONPATH so imports like 'from router import ...' work
+    env["PYTHONPATH"] = str(temp_dir / "backend") + os.pathsep + env.get("PYTHONPATH", "")
     
     try:
         # Run the backend using the portable python

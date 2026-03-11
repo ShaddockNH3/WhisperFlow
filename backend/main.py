@@ -1,10 +1,27 @@
+import os
+import sys
+import time
 import webbrowser
 import multiprocessing
 import uvicorn
+from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+from .router import ws_router
 
-load_dotenv()
+# Load .env from 'data' folder next to executable for portability
+if getattr(sys, 'frozen', False):
+    app_root = os.path.dirname(sys.executable)
+else:
+    app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+env_path = os.path.join(app_root, "data", ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
+else:
+    load_dotenv()
 
 app = FastAPI(
     title="WhisperFlow",

@@ -8,6 +8,7 @@ torchaudio
 librosa
 soundfile
 onnxruntime
+python-dotenv
 transformers
 accelerate
 websockets

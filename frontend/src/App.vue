@@ -19,6 +19,17 @@
             <el-icon style="margin-right:4px"><Monitor /></el-icon> 系统声音
           </el-radio-button>
         </el-radio-group>
+
+        <el-divider direction="vertical" />
+
+        <el-tooltip content="开启后 Whisper 识别的原始文本将由 GLM-4-Flash 进行语义纠错" placement="bottom">
+          <el-switch
+            v-model="useLLM"
+            active-text="AI 纠错"
+            inactive-text="仅识别"
+            @change="onUseLLMChange"
+          />
+        </el-tooltip>
       </div>
 
       <div class="controls">
@@ -53,15 +64,26 @@
       <div class="transcription-area">
         <h3>Live Transcription</h3>
         <div class="transcript-box" ref="transcriptBox">
-          <div v-if="transcriptHistory.length === 0" class="empty-state">
-            Start recording to see live transcriptions...
+          <div v-if="transcriptHistory.length === 0 && !currentPartial" class="empty-state">
+            开始录音后此处将显示识别结果...
           </div>
           <div v-else class="transcript-list">
-             <div v-for="(item, index) in transcriptHistory" :key="index" class="transcript-item">
-                <div class="corrected-text">{{ item.corrected_text }}</div>
-                <div class="raw-text" v-if="item.raw_text !== item.corrected_text" title="Original Whisper Output">
-                  (Raw: {{ item.raw_text }})
+             <div v-for="(item, index) in transcriptHistory" :key="index" class="transcript-item"
+               :class="{ 'transcript-item--streaming': item.streaming }">
+                <!-- 流式期间：只显示正在生成的 LLM 文本（从空开始逐字填入），不展示原始行 -->
+                <!-- 完成后：显示纠错文本，若与原始不同则在下方显示原始供参考 -->
+                <div class="corrected-text">
+                  {{ item.corrected_text }}<span v-if="item.streaming" class="cursor">|</span>
                 </div>
+                <div class="raw-text"
+                  v-if="!item.usedLLM && !item.streaming && item.corrected_text !== item.raw_text"
+                  title="Whisper 原始识别">
+                  原始：{{ item.raw_text }}
+                </div>
+             </div>
+             <!-- 语音预览行（VAD 缓冲中） -->
+             <div v-if="currentPartial" class="transcript-item transcript-item--partial">
+               <div class="corrected-text">{{ currentPartial }}<span class="cursor">|</span></div>
              </div>
           </div>
         </div>
@@ -78,8 +100,12 @@ import { ElMessage } from 'element-plus'
 const wsConnected = ref(false)
 const isRecording = ref(false)
 const inputSource = ref('microphone')
+const useLLM = ref(true)
 const transcriptHistory = ref([])
+const currentPartial = ref('')
 const transcriptBox = ref(null)
+// Accumulates LLM tokens silently until llm_done, then replaces the Whisper text
+const llmBuffer = ref('')
 
 let ws = null
 let mediaRecorder = null
@@ -102,12 +128,40 @@ const initWebSocket = () => {
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data)
-      if (data.type === 'transcription') {
+
+      if (data.type === 'transcription_raw') {
+        currentPartial.value = ''
+        llmBuffer.value = ''
+        // 立即显示 Whisper 输出；若开启 LLM 则保持 streaming 光标表示正在纠错
         transcriptHistory.value.push({
           raw_text: data.raw_text,
-          corrected_text: data.corrected_text
+          corrected_text: data.raw_text,
+          streaming: useLLM.value,
+          usedLLM: false
         })
         scrollToBottom()
+
+      } else if (data.type === 'llm_token') {
+        // 静默累积，不更新显示，等 llm_done 后一次性替换
+        llmBuffer.value += data.token
+
+      } else if (data.type === 'llm_done') {
+        const last = transcriptHistory.value[transcriptHistory.value.length - 1]
+        if (last && last.streaming) {
+          if (llmBuffer.value.trim()) {
+            // 用完整的 LLM 输出一次性覆盖 Whisper 文本
+            last.corrected_text = llmBuffer.value.trim()
+            last.usedLLM = true
+          }
+          last.streaming = false
+          llmBuffer.value = ''
+          scrollToBottom()
+        }
+
+      } else if (data.type === 'partial') {
+        currentPartial.value = data.text
+        scrollToBottom()
+
       } else if (data.type === 'error') {
         ElMessage.error(data.message)
       }
@@ -222,6 +276,7 @@ const startRecording = async () => {
 
 const stopRecording = () => {
   isRecording.value = false
+  currentPartial.value = ''
   
   if (processor) {
     processor.disconnect()
@@ -238,7 +293,13 @@ const stopRecording = () => {
     mediaRecorder.getTracks().forEach(track => track.stop())
     mediaRecorder = null
   }
-  ElMessage.info('Recording stopped')
+  ElMessage.info('识别已停止')
+}
+
+const onUseLLMChange = (val) => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'set_use_llm', value: val }))
+  }
 }
 
 const scrollToBottom = () => {
@@ -292,6 +353,8 @@ onUnmounted(() => {
 .source-selector {
   display: flex;
   justify-content: center;
+  align-items: center;
+  gap: 12px;
   margin: 20px 0 0;
 }
 
@@ -360,6 +423,32 @@ onUnmounted(() => {
   border-radius: 6px;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
   border-left: 4px solid #409eff;
+}
+
+.transcript-item--partial {
+  border-left-color: #e6a23c;
+  opacity: 0.85;
+}
+
+.transcript-item--streaming {
+  border-left-color: #67c23a;
+}
+
+.waiting-indicator {
+  color: #909399;
+  font-style: italic;
+  font-size: 0.9rem;
+}
+
+.cursor {
+  display: inline-block;
+  margin-left: 1px;
+  color: #409eff;
+  animation: blink 1s step-start infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
 }
 
 .corrected-text {

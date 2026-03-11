@@ -1,3 +1,4 @@
+import threading
 import torch
 from faster_whisper import WhisperModel
 import opencc
@@ -24,6 +25,9 @@ class WhisperTranscriber:
         
         self.model = WhisperModel(model_id, device=self.device, compute_type=self.compute_type)
         self.cc = opencc.OpenCC('t2s')  # Traditional to Simplified conversion
+        # Serialise all inference calls — prevents race condition between
+        # partial-preview and committed-phrase transcriptions running concurrently.
+        self._lock = threading.Lock()
         
         print("Faster-Whisper model loaded successfully.")
 
@@ -34,20 +38,35 @@ class WhisperTranscriber:
         """
         if len(audio_array) == 0:
             return ""
-            
-        # faster-whisper model.transcribe accepts numpy arrays, forces language="zh"
-        segments, info = self.model.transcribe(
-            audio_array,
-            language="zh",
-            beam_size=5,
-            condition_on_previous_text=False,
-            no_repeat_ngram_size=3,
-            temperature=[0.0, 0.2, 0.4]
-        )
-        
-        raw_text = "".join([segment.text for segment in segments])
-        
+
+        with self._lock:
+            # faster-whisper model.transcribe accepts numpy arrays, forces language="zh"
+            segments, info = self.model.transcribe(
+                audio_array,
+                language="zh",
+                beam_size=5,
+                condition_on_previous_text=False,
+                no_repeat_ngram_size=3,
+                repetition_penalty=1.2,
+                temperature=[0.0, 0.2, 0.4],
+                # Reject segments that are almost certainly hallucinations
+                compression_ratio_threshold=2.0,
+                log_prob_threshold=-0.8,
+                no_speech_threshold=0.6,
+            )
+
+            # Eagerly materialise segments inside the lock so the model stays
+            # consistent until we have finished reading all results.
+            collected = [
+                seg.text for seg in segments
+                if seg.compression_ratio <= 2.0
+                and seg.avg_logprob >= -0.8
+                and seg.no_speech_prob < 0.6
+            ]
+
+        raw_text = "".join(collected)
+
         # Convert Traditional to Simplified Chinese
         simplified_text = self.cc.convert(raw_text)
-        
+
         return simplified_text

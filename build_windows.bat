@@ -19,7 +19,7 @@ xcopy /e /y frontend\dist build\frontend\dist
 echo --- Step 3: Packaging with PyInstaller ---
 python -m pip install pyinstaller
 
-python -m PyInstaller --onefile ^
+python -m PyInstaller --onedir ^
     --name WhisperFlow ^
     --add-data "frontend/dist;frontend/dist" ^
     --add-data "ai/denoise/weights;ai/denoise/weights" ^

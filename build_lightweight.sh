@@ -30,7 +30,7 @@ if ! python3 -m PyInstaller --version > /dev/null 2>&1; then
     python3 -m pip install pyinstaller
 fi
 
-python3 -m PyInstaller --onefile \
+python3 -m PyInstaller --onedir \
     --name WhisperFlow \
     --add-data "frontend/dist:frontend/dist" \
     --add-data "ai/denoise/weights:ai/denoise/weights" \

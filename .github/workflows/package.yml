@@ -58,7 +58,7 @@ jobs:
     - name: Package with PyInstaller (Windows)
       if: matrix.os == 'windows-latest'
       run: |
-        python -m PyInstaller --onefile `
+        python -m PyInstaller --onedir `
           --name WhisperFlow `
           --add-data "frontend/dist;frontend/dist" `
           --add-data "ai/denoise/weights;ai/denoise/weights" `
@@ -79,7 +79,7 @@ jobs:
     - name: Package with PyInstaller (Linux)
       if: matrix.os == 'ubuntu-latest'
       run: |
-        python3 -m PyInstaller --onefile \
+        python3 -m PyInstaller --onedir \
           --name WhisperFlow \
           --add-data "frontend/dist:frontend/dist" \
           --add-data "ai/denoise/weights:ai/denoise/weights" \
@@ -97,11 +97,19 @@ jobs:
           --hidden-import uvicorn.lifespan.on \
           backend/main.py
 
-    - name: Upload Artifact
+    - name: Upload Artifact (Windows)
+      if: matrix.os == 'windows-latest'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: dist/${{ matrix.exec_name }}
+        path: dist/WhisperFlow/
+
+    - name: Upload Artifact (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact_name }}
+        path: dist/WhisperFlow/
 
   release:
     name: Create GitHub Release
@@ -123,12 +131,17 @@ jobs:
         name: WhisperFlow-Linux
         path: ./artifacts/linux
 
+    - name: Create Archives
+      run: |
+        cd artifacts/windows && zip -r ../../WhisperFlow-Windows.zip . && cd ../..
+        cd artifacts/linux && tar -czf ../../WhisperFlow-Linux.tar.gz . && cd ../..
+
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          ./artifacts/windows/WhisperFlow.exe
-          ./artifacts/linux/WhisperFlow
+          WhisperFlow-Windows.zip
+          WhisperFlow-Linux.tar.gz
         draft: false
         prerelease: false
         generate_release_notes: true

@@ -101,8 +101,7 @@ def setup_runtime():
         cmd = [
             str(PYTHON_EXE), "-m", "uv", "pip", "install",
             "--index-url", "https://pypi.org/simple",
-            "--extra-index-url", "https://download.pytorch.org/whl/cpu",
-            "--no-warn-script-location"
+            "--extra-index-url", "https://download.pytorch.org/whl/cpu"
         ] + deps
         
         subprocess.run(cmd, env=env, check=True)

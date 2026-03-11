@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import router  # Fixed: Use direct import, launcher adds folder to PYTHONPATH
+from ws_api import router as ws_router # Fixed: Actual file is ws_api.py
 
 # Load .env from 'data' folder next to executable for portability
 # We prefer the environment variable passed by our launcher
@@ -41,7 +41,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router.ws_router, prefix="/api")
+app.include_router(ws_router, prefix="/api")
 
 # Resolve static files path for portable build
 if getattr(sys, 'frozen', False):

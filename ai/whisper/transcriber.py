@@ -16,14 +16,13 @@ class WhisperTranscriber:
             "automatic-speech-recognition",
             model=model_id,
             torch_dtype=self.torch_dtype,
-            device=self.device,
-            model_kwargs={"use_flash_attention_2": False} # Set to True in prod if Flash Attention is installed
+            device=self.device
         )
         
         # Pre-warm the model with a blank audio tensor specifically to force compilation/caching if needed
         print("Whisper model loaded successfully.")
 
-    def transcribe(self, audio_array: list, sample_rate: int = 16000) -> str:
+    def transcribe(self, audio_array, sample_rate: int = 16000) -> str:
         """
         Transcribes a 1D audio numpy array (16kHz).
         Returns the recognized transcript string.

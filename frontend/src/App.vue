@@ -3,118 +3,233 @@
     <el-card class="box-card">
       <template #header>
         <div class="card-header">
-          <span>WhisperFlow Audio Recognition</span>
+          <span>WhisperFlow Real-time Recognition</span>
+          <el-tag :type="wsConnected ? 'success' : 'danger'">
+            {{ wsConnected ? 'Connected' : 'Disconnected' }}
+          </el-tag>
         </div>
       </template>
-      
-      <div class="upload-section">
-        <el-upload
-          class="upload-demo"
-          drag
-          action="#"
-          :auto-upload="false"
-          :on-change="handleFileChange"
-          :show-file-list="false"
-          accept="audio/*"
+
+      <div class="controls">
+        <el-button 
+          v-if="!isRecording"
+          type="primary" 
+          size="large"
+          @click="startRecording"
+          :disabled="!wsConnected"
         >
-          <el-icon class="el-icon--upload"><upload-filled /></el-icon>
-          <div class="el-upload__text">
-            Drop audio file here or <em>click to upload</em>
+          <el-icon><Microphone /></el-icon> Start Speaking
+        </el-button>
+        
+        <el-button 
+          v-else
+          type="danger" 
+          size="large"
+          @click="stopRecording"
+        >
+          <el-icon><VideoPause /></el-icon> Stop Speaking
+        </el-button>
+      </div>
+      
+      <div v-if="isRecording" class="recording-indicator">
+        <span class="dot"></span> Recording in progress... (Sending audio chunks to backend)
+      </div>
+
+      <el-divider />
+
+      <div class="transcription-area">
+        <h3>Live Transcription</h3>
+        <div class="transcript-box" ref="transcriptBox">
+          <div v-if="transcriptHistory.length === 0" class="empty-state">
+            Start recording to see live transcriptions...
           </div>
-        </el-upload>
-      </div>
-
-      <div class="actions" v-if="selectedFile">
-        <div class="file-info">Selected: {{ selectedFile.name }}</div>
-        <el-button type="primary" :loading="isRecognizing" @click="handleRecognize">
-          Recognize Audio
-        </el-button>
-        <el-button @click="selectedFile = null" :disabled="isRecognizing">
-          Clear
-        </el-button>
-      </div>
-
-      <el-divider v-if="results.length > 0" />
-
-      <div class="results-section" v-if="results.length > 0">
-        <h3>Recognition Results</h3>
-        <el-table :data="results" style="width: 100%" v-loading="isDeleting">
-          <el-table-column prop="filename" label="File Name" width="180" />
-          <el-table-column prop="transcription" label="Transcription" />
-          <el-table-column prop="status" label="Status" width="100">
-            <template #default="scope">
-              <el-tag :type="scope.row.status === 'completed' ? 'success' : 'info'">
-                {{ scope.row.status }}
-              </el-tag>
-            </template>
-          </el-table-column>
-          <el-table-column fixed="right" label="Operations" width="120">
-            <template #default="scope">
-              <el-button link type="danger" size="small" @click="handleDelete(scope.row.task_id)">
-                Delete
-              </el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+          <div v-else class="transcript-list">
+             <div v-for="(item, index) in transcriptHistory" :key="index" class="transcript-item">
+                <div class="corrected-text">{{ item.corrected_text }}</div>
+                <div class="raw-text" v-if="item.raw_text !== item.corrected_text" title="Original Whisper Output">
+                  (Raw: {{ item.raw_text }})
+                </div>
+             </div>
+          </div>
+        </div>
       </div>
     </el-card>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue'
-import { UploadFilled } from '@element-plus/icons-vue'
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { Microphone, VideoPause } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { recognizeAudio, deleteRecord } from './services/api.js'
 
-const selectedFile = ref(null)
-const isRecognizing = ref(false)
-const isDeleting = ref(false)
-const results = ref([])
+const wsConnected = ref(false)
+const isRecording = ref(false)
+const transcriptHistory = ref([])
+const transcriptBox = ref(null)
 
-const handleFileChange = (file) => {
-  if (file.raw.type.startsWith('audio/')) {
-    selectedFile.value = file.raw
-  } else {
-    ElMessage.error('Please select an audio file!')
-  }
-}
+let ws = null
+let mediaRecorder = null
+let audioContext = null
+let processor = null
+let source = null
 
-const handleRecognize = async () => {
-  if (!selectedFile.value) return
+// Initialize WebSocket connection to backend
+const initWebSocket = () => {
+  // Assuming frontend is essentially same host but different port, hardcoding for local dev
+  const wsUrl = `ws://localhost:8000/api/ws/recognize`
   
-  isRecognizing.value = true
-  try {
-    const data = await recognizeAudio(selectedFile.value)
-    results.value.unshift(data)
-    ElMessage.success('Audio recognized successfully')
-    selectedFile.value = null
-  } catch (error) {
-    ElMessage.error(error.response?.data?.detail || 'Failed to recognize audio')
-  } finally {
-    isRecognizing.value = false
+  ws = new WebSocket(wsUrl)
+  
+  ws.onopen = () => {
+    wsConnected.value = true
+    console.log('WebSocket connected')
+  }
+  
+  ws.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data)
+      if (data.type === 'transcription') {
+        transcriptHistory.value.push({
+          raw_text: data.raw_text,
+          corrected_text: data.corrected_text
+        })
+        scrollToBottom()
+      } else if (data.type === 'error') {
+        ElMessage.error(data.message)
+      }
+    } catch(e) {
+      console.error('Error parsing WS message:', e)
+    }
+  }
+  
+  ws.onclose = () => {
+    wsConnected.value = false
+    console.log('WebSocket disconnected')
+    if (isRecording.value) {
+        stopRecording()
+    }
+    // Attempt reconnect after delay
+    setTimeout(initWebSocket, 3000)
+  }
+  
+  ws.onerror = (error) => {
+    console.error('WebSocket Error', error)
   }
 }
 
-const handleDelete = async (taskId) => {
-  isDeleting.value = true
+// Function to resample AudioBuffer to 16kHz
+const resampleAudioBuffer = async (audioBuffer, targetSampleRate) => {
+    const offlineCtx = new OfflineAudioContext(
+        audioBuffer.numberOfChannels,
+        audioBuffer.duration * targetSampleRate,
+        targetSampleRate
+    );
+    const bufferSource = offlineCtx.createBufferSource();
+    bufferSource.buffer = audioBuffer;
+    bufferSource.connect(offlineCtx.destination);
+    bufferSource.start(0);
+    return await offlineCtx.startRendering();
+}
+
+const startRecording = async () => {
   try {
-    await deleteRecord(taskId)
-    results.value = results.value.filter(r => r.task_id !== taskId)
-    ElMessage.success('Record deleted successfully')
-  } catch (error) {
-    ElMessage.error(error.response?.data?.detail || 'Failed to delete record')
-  } finally {
-    isDeleting.value = false
+    const stream = await navigator.mediaDevices.getUserMedia({ 
+      audio: {
+        channelCount: 1, // Mono
+        echoCancellation: true,
+        noiseSuppression: true
+      } 
+    })
+    
+    // Use Web Audio API to capture raw PCM instead of compressed MediaRecorder formats
+    // to bypass the need for FFmpeg on the backend.
+    audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
+    source = audioContext.createMediaStreamSource(stream)
+    
+    // We want relatively large chunks for VAD processing (e.g. 512-4096 samples)
+    // 4096 / 16000 is about 256ms chunk size. 
+    processor = audioContext.createScriptProcessor(4096, 1, 1)
+    
+    source.connect(processor)
+    processor.connect(audioContext.destination)
+    
+    processor.onaudioprocess = (e) => {
+      if (!isRecording.value || !wsConnected.value) return
+      
+      const float32Array = e.inputBuffer.getChannelData(0)
+      
+      // Convert Float32Array (-1.0 to 1.0) to Int16Array (-32768 to 32767) for WebSocket transport
+      // Backend expects Int16 PCM array.
+      const int16Array = new Int16Array(float32Array.length)
+      for (let i = 0; i < float32Array.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]))
+        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
+      }
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+         ws.send(int16Array.buffer)
+      }
+    }
+    
+    // Keep a reference to stop later
+    mediaRecorder = stream
+    isRecording.value = true
+    ElMessage.success('Microphone started')
+    
+  } catch (err) {
+    console.error('Error accessing microphone:', err)
+    ElMessage.error('Microphone access denied or not available')
   }
 }
+
+const stopRecording = () => {
+  isRecording.value = false
+  
+  if (processor) {
+    processor.disconnect()
+    processor.onaudioprocess = null
+  }
+  if (source) {
+    source.disconnect()
+  }
+  if (audioContext) {
+    audioContext.close()
+  }
+  
+  if (mediaRecorder) {
+    mediaRecorder.getTracks().forEach(track => track.stop())
+    mediaRecorder = null
+  }
+  ElMessage.info('Recording stopped')
+}
+
+const scrollToBottom = () => {
+  nextTick(() => {
+    if (transcriptBox.value) {
+      transcriptBox.value.scrollTop = transcriptBox.value.scrollHeight
+    }
+  })
+}
+
+onMounted(() => {
+  initWebSocket()
+})
+
+onUnmounted(() => {
+  stopRecording()
+  if (ws) {
+    ws.close()
+  }
+})
 </script>
 
 <style scoped>
 .app-container {
   display: flex;
   justify-content: center;
-  padding: 20px;
+  padding: 40px;
+  background-color: #f5f7fa;
+  min-height: 100vh;
 }
 
 .box-card {
@@ -130,29 +245,83 @@ const handleDelete = async (taskId) => {
   font-size: 1.2rem;
 }
 
-.upload-section {
-  margin-bottom: 20px;
+.controls {
+  display: flex;
+  justify-content: center;
+  margin: 30px 0;
 }
 
-.actions {
+.recording-indicator {
+  text-align: center;
+  color: #e6a23c;
+  font-size: 0.9rem;
+  margin-bottom: 20px;
   display: flex;
   align-items: center;
-  gap: 15px;
-  margin-bottom: 20px;
+  justify-content: center;
+  gap: 8px;
 }
 
-.file-info {
-  flex-grow: 1;
-  color: #606266;
-  font-size: 0.9rem;
+.dot {
+  width: 10px;
+  height: 10px;
+  background-color: #f56c6c;
+  border-radius: 50%;
+  animation: pulse 1.5s infinite;
 }
 
-.results-section {
-  margin-top: 20px;
+@keyframes pulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(245, 108, 108, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(245, 108, 108, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(245, 108, 108, 0); }
 }
 
-.results-section h3 {
-  margin-bottom: 15px;
+.transcription-area h3 {
+  margin-top: 0;
   color: #303133;
+}
+
+.transcript-box {
+  background-color: #fafafa;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  min-height: 300px;
+  max-height: 500px;
+  overflow-y: auto;
+  padding: 20px;
+}
+
+.empty-state {
+  color: #909399;
+  text-align: center;
+  margin-top: 100px;
+  font-style: italic;
+}
+
+.transcript-list {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.transcript-item {
+  background-color: white;
+  padding: 15px;
+  border-radius: 6px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+  border-left: 4px solid #409eff;
+}
+
+.corrected-text {
+  font-size: 1.1rem;
+  color: #303133;
+  line-height: 1.5;
+}
+
+.raw-text {
+  font-size: 0.85rem;
+  color: #909399;
+  margin-top: 5px;
+  font-style: italic;
 }
 </style>

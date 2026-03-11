@@ -10,22 +10,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from ai.denoise.model import DenoiseCRNN
 
-def denoise_audio(model_path: str, input_wav: str, output_wav: str):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Load model
-    model = DenoiseCRNN().to(device)
-    if not os.path.exists(model_path):
-        print(f"Error: Model weights not found at {model_path}")
-        return
-        
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    
-    # Load audio bypassing torchaudio.load to avoid missing codecs
-    data, sr = sf.read(input_wav, dtype='float32')
-    waveform = torch.from_numpy(data)
+import numpy as np
+
+def denoise_array(model, waveform_np: np.ndarray, sr: int = 16000) -> np.ndarray:
+    device = next(model.parameters()).device
+    waveform = torch.from_numpy(waveform_np)
     
     if waveform.dim() == 1:
         waveform = waveform.unsqueeze(0)
@@ -73,8 +62,27 @@ def denoise_audio(model_path: str, input_wav: str, output_wav: str):
     enhanced_waveform = torch.istft(enhanced_stft, n_fft=n_fft, hop_length=hop_length, 
                                     win_length=win_length, window=window)
                                     
-    enhanced_waveform = enhanced_waveform.cpu().numpy()
-    sf.write(output_wav, enhanced_waveform, sr)
+    return enhanced_waveform.cpu().numpy()
+
+def denoise_audio(model_path: str, input_wav: str, output_wav: str):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load model
+    model = DenoiseCRNN().to(device)
+    if not os.path.exists(model_path):
+        print(f"Error: Model weights not found at {model_path}")
+        return
+        
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    # Load audio bypassing torchaudio.load to avoid missing codecs
+    data, sr = sf.read(input_wav, dtype='float32')
+    
+    enhanced_waveform_np = denoise_array(model, data, sr)
+    
+    sf.write(output_wav, enhanced_waveform_np, 16000)
     print(f"Denoised audio saved to {output_wav}")
 
 if __name__ == "__main__":

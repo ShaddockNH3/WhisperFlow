@@ -10,3 +10,4 @@ soundfile
 onnxruntime
 transformers
 accelerate
+websockets

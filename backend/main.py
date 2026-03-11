@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api import router as api_router
+from ws_api import router as ws_router
 
 app = FastAPI(
     title="WhisperFlow API",
@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(api_router, prefix="/api")
+app.include_router(ws_router, prefix="/api")
 
 @app.get("/")
 async def root():

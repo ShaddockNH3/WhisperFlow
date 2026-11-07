@@ -1,56 +1,90 @@
-# WhisperFlow 高性能流式语音识别系统
+# WhisperFlow
 
-WhisperFlow 是一个基于 FastAPI 和 Vue 3 的实时、流式语音识别（ASR）系统。该项目内置了一套完整的 AI 处理回路，包含硬件级 VAD 智能断句、CRNN 音频降噪、faster-whisper 识别引擎以及基于大语言模型（LLM）的流式纠错机制，旨在提供低延迟、高准确率的语音交互体验。
+浏览器端实时语音转写：麦克风切片 → WebSocket 送后端 → VAD 断句 → CRNN 降噪 → faster-whisper 识别 → LLM 流式纠错 → 回显。FastAPI + Vue 3。
 
-## 🧠 系统架构与设计思路
+## 快速开始
 
-WhisperFlow 是一个前后端分离的伪流式 ASR 平台，目标在嘈杂环境下实现低延迟、高鲁棒性的实时语音转写与上下文纠错。
+```bash
+uv venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+uv pip install -r backend/requirements.txt
 
-*   前端（客户端）：基于 Vue 3 + Vite；使用 Web Audio API 或 MediaRecorder 采集麦克风音频，按固定时长（例如 500ms）截取为 Int16Array，并通过 WebSocket 以二进制流持续发送；支持展示实时波形与逐字、逐句回显。
-*   后端（服务端）：基于 FastAPI + Uvicorn（asyncio）；提供 WebSocket 端点接收音频流，使用相关库进行内存解码与重采样，确保音频满足 16kHz、单声道、16-bit PCM 的标准格式，通过异步队列缓冲并调度后续处理，具备出色的高并发连接支持能力。
-*   数据流与调度：前端切片 -> 后端接收并重采样 -> 降噪 -> VAD 判定段边界 -> Whisper 推理 -> LLM 纠错（可选） -> 结果通过 WebSocket 回传前端。
+cp backend/.env.example backend/.env      # 填 LLM_API_KEY（不填就关掉纠错）
 
-### 流式语音识别管道 (AI Pipeline)
+cd frontend && npm install && npm run build && cd ..
 
-传统端到端识别模型通常需要等待接收到完整的音频段落后方可进行处理，存在延迟较高且易丢失上下文的问题。WhisperFlow 采用了轻巧的伪流式架构，三级级联模块设计具体如下：
+python backend/main.py                    # 默认 http://127.0.0.1:8000
+```
 
-1.  Stage 1 — 轻量级降噪前端：基于 PyTorch 实现的轻量 DFN/CRNN，基于 STFT 预测频域掩膜（IRM），对噪声进行抑制并通过 ISTFT 重建增强波形，提高噪声鲁棒性。
-2.  Stage 2 — VAD + 伪流式分段：集成 Silero VAD（或类似模块）监测语音活动；基于 VAD 动态缓冲（例如静音持续超 400ms 触发切片）进行分段，避免固定窗口切片带来的延迟和上下文截断。
-3.  Stage 3 — Whisper 转录与 LLM 后处理：将增强后的音频段送入经过优化的 faster-whisper（默认 turbo 模型）进行推理；随后将初稿送入外部大语言模型（如 GLM-4-flash）执行上下文纠错、同音字消歧与标点恢复。
-4.  模型“幻觉”抑制引擎：本项目引入了基于序列相似度算法 (`difflib`) 的历史记录比对模组。当系统的输出文本与近期识别结果的相似度过高（表明模型发生重复输出错觉）时，系统判定其为无效的重复结果并主动拦截。这种机制极大降低了 Whisper 模型在特定场景下的误识率。
+跑单测（只覆盖纯逻辑，不需要装 torch）：
 
-## 🎯 快速开始
+```bash
+python -m unittest discover -s tests -t .
+```
 
-1. 环境配置
-   ```bash
-   git clone https://github.com/ShaddockNH3/WhisperFlow.git
-   cd WhisperFlow
-   
-   uv venv
-   
-   # Windows 执行: .venv\Scripts\activate
-   # Linux/Mac 执行: source .venv/bin/activate
-   
-   uv pip install -r backend/requirements.txt
-   ```
+## 管道
 
-2. 填写配置文件
-   在 `backend` 目录下创建 `.env` 环境变量配置文件。若需要启用 LLM 语义流式纠正引擎（建议开启），请填入大参数接口调用鉴权：
-   ```env
-   # ZhipuAI GLM 接口示例配置
-   LLM_API_KEY=您的_API_KEY_填写于此
-   ```
+| 阶段 | 做什么 | 实现 |
+| --- | --- | --- |
+| 前端 | MediaRecorder 按 500ms 切片，Int16Array 二进制上送 | `frontend/src` |
+| 接收 | 解码、重采样到 16k 单声道、丢进单线程执行器（VAD 有状态，不能并发） | `backend/ws_api.py` |
+| Stage 1 | CRNN 预测频域掩膜（IRM）做降噪，ISTFT 重建 | `ai/denoise` |
+| Stage 2 | VAD 判定语音段边界，静音超时即切片 | `ai/vad` |
+| Stage 3 | faster-whisper 转录，OpenCC 繁转简 | `ai/whisper` |
+| 后处理 | LLM 流式纠错 + 复读拦截 | `ai/llm`、`ai/dedup.py` |
 
-3. 静态资源编译
-   ```bash
-   cd frontend
-   npm install
-   npm run build
-   ```
+管道把四个阶段收成 `Stages`（vad / denoise / transcribe / correct_stream），默认实现放在 `build_default_stages`，只有真正要跑模型时才 import torch。
 
-4. 测试验证运行
-   ```bash
-   # 在项目根目录下启动入口进程
-   python backend/main.py
-   ```
-   应用服务顺利启动后，系统将自动调用默认浏览器跳转至 `http://127.0.0.1:8000`。
+## 配置
+
+环境变量都在 `backend/.env`，代码里不留魔法值。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ZHIPUAI_API_KEY` | 无 | LLM 纠错用的接口密钥 |
+| `WHISPERFLOW_WHISPER_MODEL` | `openai/whisper-turbo` | 转录模型，内部会映射到 `large-v3-turbo` |
+| `WHISPERFLOW_LLM_MODEL` | `glm-4-flash-250414` | 纠错模型 |
+| `WHISPERFLOW_USE_LLM` | `true` | 关掉就只做转录 |
+| `WHISPERFLOW_DENOISE_WEIGHTS` | `ai/denoise/weights/denoise_crnn.pt` | 降噪权重，相对路径按项目根解析 |
+| `WHISPERFLOW_VAD_THRESHOLD` | `0.15` | VAD 灵敏度 |
+| `WHISPERFLOW_REPEAT_THRESHOLD` | `0.85` | 相邻句相似度超过就判复读丢掉 |
+| `WHISPERFLOW_HISTORY_THRESHOLD` | `0.7` | 纠错结果和上下文太像就不入库 |
+| `WHISPERFLOW_INTERIM_INTERVAL_S` | `1.5` | 临时预览的间隔 |
+| `WHISPERFLOW_MIN_INTERIM_SAMPLES` | `20000` | 预览前的最少缓冲采样数（约 1.25 秒） |
+
+## 项目结构
+
+```
+ai/
+├── config.py     环境变量 → 配置对象
+├── dedup.py      复读拦截与上下文窗口（纯 difflib，可单测）
+├── pipeline.py   Stages 注入 + 会话级管道
+├── vad/          Silero VAD 与段缓冲
+├── denoise/      CRNN 掩膜降噪、训练与推理脚本
+├── whisper/      faster-whisper 封装
+└── llm/          GLM 流式纠错
+backend/
+├── main.py       FastAPI 入口、CORS、静态站点
+└── ws_api.py     /api/ws/recognize，二进制音频与控制消息
+frontend/         Vue 3 界面
+tests/            纯逻辑单测（19 个）
+```
+
+## 已知问题
+
+- 单连接串行推理：`_pipeline_executor` 只有一个线程，多人同时说话会排队。要多路并发得给每连接独立 VAD 实例并扩线程池。
+- 降噪权重随仓库走（`denoise_crnn.pt`），仓库因此偏大；换机器跑要先确认路径。
+- `ai/test_pipeline.py`、`ai/vad/test_vad.py` 需要 torch 和测试音频，跟 `tests/` 下的纯逻辑单测分开跑。
+- 前端构建产物要手动 `npm run build`，后端只负责托管 `dist`。
+- LLM 纠错依赖外部接口，没网或没 key 时只能拿到原始转录。
+
+## 更多
+
+架构取舍与重构说明见 [docs/DESIGN.md](docs/DESIGN.md)。
+
+## 致谢
+
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper)、[Silero VAD](https://github.com/snakers4/silero-vad)、[FastAPI](https://fastapi.tiangolo.com/)、[OpenCC](https://github.com/BYVoid/OpenCC)。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。

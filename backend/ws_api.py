@@ -12,10 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 # Add project root to path so 'ai.pipeline' can be imported
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from ai.config import load_stream_settings
 from ai.pipeline import AIPipeline
 import json
 
 router = APIRouter()
+
+# 节奏参数从环境变量读，默认值和原来写死的常量一致
+_stream = load_stream_settings()
 
 # Sentinel returned by _safe_next when the generator is exhausted.
 # Using run_in_executor(next, gen) would propagate StopIteration into a Future, which
@@ -30,14 +34,14 @@ def _safe_next(gen):
         return _STOP
 
 # Thread pool for running blocking Whisper inference without blocking the event loop
-_executor = ThreadPoolExecutor(max_workers=2)
+_executor = ThreadPoolExecutor(max_workers=_stream.inference_workers)
 # Single-threaded executor that serialises all pipeline calls (VAD + Whisper share state)
-_pipeline_executor = ThreadPoolExecutor(max_workers=1)
+_pipeline_executor = ThreadPoolExecutor(max_workers=_stream.pipeline_workers)
 
 # How often (seconds) to emit an interim partial transcription while speech is buffering
-INTERIM_INTERVAL_S = 1.5
+INTERIM_INTERVAL_S = _stream.interim_interval_s
 # Minimum buffered audio (samples) before attempting a partial transcription (avoid noise-only results)
-MIN_INTERIM_SAMPLES = 20000  # ~1.25 s @ 16 kHz
+MIN_INTERIM_SAMPLES = _stream.min_interim_samples
 
 # Global pipeline instance (loaded lazily or on startup)
 pipeline_instance = None
@@ -59,7 +63,7 @@ async def websocket_recognize(websocket: WebSocket):
     last_interim_time = 0.0
     partial_task: asyncio.Task | None = None
     llm_task: asyncio.Task | None = None
-    use_llm = True  # default; toggled by frontend control messages
+    use_llm = pipeline.use_llm  # 服务端可通过环境变量整体关掉，前端控制消息只做单连接覆盖
 
     try:
         while True:

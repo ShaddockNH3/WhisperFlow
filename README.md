@@ -1,3 +1,5 @@
+> 闲时重构，见重构分支。
+
 # WhisperFlow 高性能流式语音识别系统
 
 WhisperFlow 是一个基于 FastAPI 和 Vue 3 的实时、流式语音识别（ASR）系统。该项目内置了一套完整的 AI 处理回路，包含硬件级 VAD 智能断句、CRNN 音频降噪、faster-whisper 识别引擎以及基于大语言模型（LLM）的流式纠错机制，旨在提供低延迟、高准确率的语音交互体验。

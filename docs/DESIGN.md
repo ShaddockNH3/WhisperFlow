@@ -45,6 +45,29 @@ for prev in history[-3:]:
 
 环境变量一读就该定下来。用不可变对象传递，避免运行中被某处改掉一半（原来 `use_llm` 就是被前端控制消息直接改的局部变量）。前端仍然可以按连接覆盖，但服务端关掉纠错时 `pipeline.use_llm` 是 False，连接初始化就继承它。
 
+## 前端
+
+`App.vue` 原来 578 行：模板 96 行、脚本 312 行，WebSocket 消息处理、音频采集、断线重连、界面全在一个 `<script setup>` 里。
+
+最难验证的是那段 `ws.onmessage`：一百多行 if/else 直接改 reactive 数组，状态有四种（partial / whisper_done / sentence_open / final），还夹着"过期的 LLM 响应要丢掉"这种时序判断。改坏一个分支，界面上只是少一行字，肉眼很难发现。
+
+拆完：
+
+| 文件 | 职责 |
+| --- | --- |
+| `services/transcript.js` | 状态机：`createTranscriptState` + `applyMessage`，纯函数 |
+| `services/audio-capture.js` | getUserMedia/getDisplayMedia、16k 重采样、Int16 分帧 |
+| `composables/useRecognition.js` | 建连、重连、录音开关、把消息喂给状态机 |
+| `components/ControlPanel.vue` | 音源、AI 纠错开关、开始/停止、录音提示 |
+| `components/TranscriptPanel.vue` | 字幕列表与自动滚动 |
+| `App.vue` | 71 行的版面 |
+
+状态机抽出来之后就能测了：13 个用例覆盖"LLM 模式下新片段并进同一句、不新起一行"、"过期 llm_done 丢弃"、"没句号时标记 sentence_open"、"关录音时收尾"等时序分支。
+
+验证方式：`node --test tests/*.test.js`；另外用自研的假后端（静态服务 + 手写 WS 握手，8000 端口按脚本推消息）在浏览器里跑了一遍完整链路，两条字幕的状态和边框颜色都对。
+
+顺带补了 `vite.config.js` 的 `@` 别名（另外两个前端都有，这个没有）。
+
 ## 代价
 
 - 多了一层 `Stages` 抽象，读代码时要在 `pipeline.py` 和 `build_default_stages` 之间来回看。

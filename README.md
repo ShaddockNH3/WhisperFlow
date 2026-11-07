@@ -65,7 +65,10 @@ ai/
 backend/
 ├── main.py       FastAPI 入口、CORS、静态站点
 └── ws_api.py     /api/ws/recognize，二进制音频与控制消息
-frontend/         Vue 3 界面
+frontend/
+├── src/services/      转写状态机与音频采集（不依赖 Vue）
+├── src/composables/   录音与 WebSocket 接线
+└── src/components/    控制面板与转写面板
 tests/            纯逻辑单测（19 个）
 ```
 
